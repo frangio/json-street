@@ -182,34 +182,60 @@ class Input {
    */
   #scanChunk(): boolean {
     const buf = this.#buf;
-    for (; this.#pos < buf.length; this.#pos++) {
-      const c = buf.charCodeAt(this.#pos);
-      if (this.#inString) {
+    let pos = this.#pos;
+    let depth = this.#depth;
+    let inString = this.#inString;
+    let done = false;
+    while (pos < buf.length) {
+      if (inString) {
+        // Find the closing quote: the first one preceded by an even number of
+        // backslashes. Only backslashes in this chunk count; an odd run at
+        // the end of the previous chunk escapes the first character here.
+        let from = pos;
         if (this.#escaped) {
+          from++;
           this.#escaped = false;
-        } else if (c === BACKSLASH) {
-          this.#escaped = true;
-        } else if (c === QUOTE) {
-          this.#inString = false;
-          if (this.#depth === 0) {
-            this.#pos++;
-            return true;
-          }
         }
-      } else if (this.#depth === 0) {
-        if (isDelimiter(c)) return true;
+        let quote = buf.indexOf('"', from);
+        while (quote !== -1 && backslashesBefore(buf, quote, from) % 2 === 1) {
+          quote = buf.indexOf('"', quote + 1);
+        }
+        if (quote === -1) {
+          this.#escaped = from < buf.length && backslashesBefore(buf, buf.length, from) % 2 === 1;
+          pos = buf.length;
+          break;
+        }
+        pos = quote + 1;
+        inString = false;
+        if (depth === 0) {
+          done = true;
+          break;
+        }
+        continue;
+      }
+      const c = buf.charCodeAt(pos);
+      if (depth === 0) {
+        if (isDelimiter(c)) {
+          done = true;
+          break;
+        }
       } else if (c === QUOTE) {
-        this.#inString = true;
+        inString = true;
       } else if (c === LBRACKET || c === LBRACE) {
-        this.#depth++;
+        depth++;
       } else if (c === RBRACKET || c === RBRACE) {
-        if (--this.#depth === 0) {
-          this.#pos++;
-          return true;
+        if (--depth === 0) {
+          pos++;
+          done = true;
+          break;
         }
       }
+      pos++;
     }
-    return false;
+    this.#pos = pos;
+    this.#depth = depth;
+    this.#inString = inString;
+    return done;
   }
 }
 
@@ -366,6 +392,13 @@ class Value implements JsonStValue {
     this.#input.enter();
     this.#entered = true;
   }
+}
+
+/** Counts the backslashes that precede `end`, back to `start`. */
+function backslashesBefore(buf: string, end: number, start: number): number {
+  let i = end;
+  while (i > start && buf.charCodeAt(i - 1) === BACKSLASH) i--;
+  return end - i;
 }
 
 const TYPE_NAMES: Record<number, string> = { [QUOTE]: 'string', [LBRACKET]: 'array', [LBRACE]: 'object' };

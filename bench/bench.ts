@@ -1,7 +1,14 @@
 // Usage: node bench/bench.ts [name-filter]
-// Reports the median throughput of each workload in MB/s of JSON text.
+// Reports the best throughput of each workload in MB/s of JSON text, using
+// the CPU time of the main thread, which is less noisy than wall time. Each
+// workload runs in a separate process to isolate them from each other.
 
-import { parseValues, type JsonStValue } from '../src/index.ts';
+import { execFileSync } from 'node:child_process';
+import type { JsonStValue } from '../src/index.ts';
+
+// JSONST_LIB selects another build of the library, to compare versions.
+const { parseValues }: typeof import('../src/index.ts') =
+  await import(process.env.JSONST_LIB ?? '../src/index.ts');
 
 let seed = 1;
 function random(): number {
@@ -155,19 +162,23 @@ const workloads: Workload[] = [
   },
 ];
 
-const filter = process.argv[2] ?? '';
-const RUNS = 5;
+const RUNS = 7;
+const [filter = '', only] = process.argv.slice(2);
 
-for (const { name, text, chunkSize = 65536, run } of workloads) {
-  if (!name.includes(filter)) continue;
-  const input = chunks(text, chunkSize);
-  const times = [];
-  for (let i = 0; i < RUNS + 2; i++) {
-    const start = performance.now();
-    await run(parseValues(stream(input)));
-    if (i >= 2) times.push(performance.now() - start);
+if (only === undefined) {
+  for (const { name } of workloads) {
+    if (!name.includes(filter)) continue;
+    execFileSync(process.execPath, [import.meta.filename, '', name], { stdio: 'inherit' });
   }
-  times.sort((a, b) => a - b);
-  const median = times[RUNS >> 1]!;
-  console.log(`${name.padEnd(40)} ${(text.length / 1e6 / (median / 1e3)).toFixed(0).padStart(6)} MB/s`);
+} else {
+  const { name, text, chunkSize = 65536, run } = workloads.find(w => w.name === only)!;
+  const input = chunks(text, chunkSize);
+  let best = Infinity;
+  for (let i = 0; i < RUNS; i++) {
+    const start = process.threadCpuUsage();
+    await run(parseValues(stream(input)));
+    const { user, system } = process.threadCpuUsage(start);
+    best = Math.min(best, (user + system) / 1e3);
+  }
+  console.log(`${name.padEnd(40)} ${(text.length / 1e6 / (best / 1e3)).toFixed(0).padStart(6)} MB/s`);
 }
