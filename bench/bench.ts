@@ -1,12 +1,18 @@
-// Usage: node bench/bench.ts [name-filter]
-// Reports the best throughput of each workload in MB/s of JSON text, using
-// the CPU time of the main thread, which is less noisy than wall time. Each
-// workload runs in a separate process to isolate them from each other.
+// Usage: node bench/bench.ts [name-filter] [--base <git-ref>]
+//
+// Reports the throughput of each workload in MB/s of JSON text, using the
+// CPU time of the main thread, which is less noisy than wall time. Each
+// measurement runs in a separate process to isolate workloads from each other.
+//
+// With --base, compares the working tree against the library at a git ref,
+// alternating between the two so that drift in the machine affects both.
 
 import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { JsonStValue } from '../src/index.ts';
 
-// JSONST_LIB selects another build of the library, to compare versions.
 const { parseValues }: typeof import('../src/index.ts') =
   await import(process.env.JSONST_LIB ?? '../src/index.ts');
 
@@ -163,15 +169,22 @@ const workloads: Workload[] = [
 ];
 
 const RUNS = 7;
-const [filter = '', only] = process.argv.slice(2);
+const ROUNDS = 5;
 
-if (only === undefined) {
-  for (const { name } of workloads) {
-    if (!name.includes(filter)) continue;
-    execFileSync(process.execPath, [import.meta.filename, '', name], { stdio: 'inherit' });
-  }
-} else {
-  const { name, text, chunkSize = 65536, run } = workloads.find(w => w.name === only)!;
+/** Runs a workload in a child process and returns its throughput in MB/s. */
+function measure(name: string, lib?: string): number {
+  const env = { ...process.env, JSONST_WORKLOAD: name, JSONST_LIB: lib };
+  return Number(execFileSync(process.execPath, [import.meta.filename], { env, encoding: 'utf8' }));
+}
+
+function median(xs: number[]): number {
+  return [...xs].sort((a, b) => a - b)[xs.length >> 1]!;
+}
+
+const only = process.env.JSONST_WORKLOAD;
+
+if (only !== undefined) {
+  const { text, chunkSize = 65536, run } = workloads.find(w => w.name === only)!;
   const input = chunks(text, chunkSize);
   let best = Infinity;
   for (let i = 0; i < RUNS; i++) {
@@ -180,5 +193,31 @@ if (only === undefined) {
     const { user, system } = process.threadCpuUsage(start);
     best = Math.min(best, (user + system) / 1e3);
   }
-  console.log(`${name.padEnd(40)} ${(text.length / 1e6 / (best / 1e3)).toFixed(0).padStart(6)} MB/s`);
+  console.log(text.length / 1e6 / (best / 1e3));
+} else {
+  const args = process.argv.slice(2);
+  const baseIndex = args.indexOf('--base');
+  const base = baseIndex === -1 ? undefined : args.splice(baseIndex, 2)[1]!;
+  const filter = args[0] ?? '';
+  let baseLib: string | undefined;
+  if (base !== undefined) {
+    baseLib = join(tmpdir(), `jsonst-base-${process.pid}.ts`);
+    writeFileSync(baseLib, execFileSync('git', ['show', `${base}:src/index.ts`]));
+    console.log(`${''.padEnd(40)} ${base.padStart(8)} ${'current'.padStart(8)} ${'change'.padStart(8)}`);
+  }
+  const fmt = (x: number) => x.toFixed(0).padStart(8);
+  for (const { name } of workloads) {
+    if (!name.includes(filter)) continue;
+    if (baseLib === undefined) {
+      console.log(`${name.padEnd(40)} ${fmt(measure(name))} MB/s`);
+      continue;
+    }
+    const before = [], after = [];
+    for (let i = 0; i < ROUNDS; i++) {
+      before.push(measure(name, baseLib));
+      after.push(measure(name));
+    }
+    const change = (median(after) / median(before) - 1) * 100;
+    console.log(`${name.padEnd(40)} ${fmt(median(before))} ${fmt(median(after))} ${(change >= 0 ? '+' : '') + change.toFixed(1).padStart(6)}%`);
+  }
 }
