@@ -6,6 +6,8 @@
 //
 // With --base, compares the working tree against the library at a git ref,
 // alternating between the two so that drift in the machine affects both.
+// When the library at the ref only accepts text, decoding the bytes is part
+// of its time, as it would be for its users.
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
@@ -83,99 +85,76 @@ async function read(value: JsonStValue, expected: unknown): Promise<unknown> {
   }
 }
 
-type Workload = { name: string; text: string; chunkSize?: number; bytes?: boolean; run: (values: AsyncIterable<JsonStValue>) => Promise<unknown> };
+/** Input is UTF-8 bytes in 64 KB chunks unless the workload says otherwise. */
+type Workload = {
+  name: string;
+  json: string;
+  chunkSize?: number;
+  text?: boolean;
+  run: (values: AsyncIterable<JsonStValue>) => Promise<unknown>;
+};
+
+async function parseEach(values: AsyncIterable<JsonStValue>): Promise<unknown[]> {
+  const items = [];
+  for await (const v of values) for await (const item of v.arrayValues()) items.push(await item.parse());
+  return items;
+}
+
+async function selectIds(values: AsyncIterable<JsonStValue>): Promise<unknown[]> {
+  const ids = [];
+  for await (const v of values) {
+    for await (const item of v.arrayValues()) {
+      for await (const [k, val] of item.objectEntries()) {
+        if (await k.parse() === 'id') ids.push(await val.parse());
+      }
+    }
+  }
+  return ids;
+}
 
 const workloads: Workload[] = [
   {
     name: 'JSON.parse (reference)',
-    text: recordsJson,
+    json: recordsJson,
+    text: true,
     run: async () => JSON.parse(recordsJson),
   },
   {
     name: 'parse whole document',
-    text: recordsJson,
+    json: recordsJson,
     run: async values => {
       for await (const v of values) return await v.parse();
     },
   },
-  {
-    name: 'parse each array element',
-    text: recordsJson,
-    run: async values => {
-      const items = [];
-      for await (const v of values) for await (const item of v.arrayValues()) items.push(await item.parse());
-      return items;
-    },
-  },
-  {
-    name: 'parse each array element, 1 KB chunks',
-    text: recordsJson,
-    chunkSize: 1024,
-    run: async values => {
-      const items = [];
-      for await (const v of values) for await (const item of v.arrayValues()) items.push(await item.parse());
-      return items;
-    },
-  },
-  {
-    name: 'parse each array element, bytes',
-    text: recordsJson,
-    bytes: true,
-    run: async values => {
-      const items = [];
-      for await (const v of values) for await (const item of v.arrayValues()) items.push(await item.parse());
-      return items;
-    },
-  },
+  { name: 'parse each array element', json: recordsJson, run: parseEach },
+  { name: 'parse each array element, 1 KB chunks', json: recordsJson, chunkSize: 1024, run: parseEach },
   {
     name: 'parse each NDJSON line',
-    text: ndjson,
+    json: ndjson,
     run: async values => {
       const items = [];
       for await (const v of values) items.push(await v.parse());
       return items;
     },
   },
-  {
-    name: 'select one field per element',
-    text: recordsJson,
-    run: async values => {
-      const ids = [];
-      for await (const v of values) {
-        for await (const item of v.arrayValues()) {
-          for await (const [k, val] of item.objectEntries()) {
-            if (await k.parse() === 'id') ids.push(await val.parse());
-          }
-        }
-      }
-      return ids;
-    },
-  },
+  { name: 'select one field per element', json: recordsJson, run: selectIds },
   {
     name: 'stream everything',
-    text: recordsJson,
+    json: recordsJson,
     run: async values => {
       for await (const v of values) return await read(v, records);
     },
   },
   {
     name: 'skip everything',
-    text: recordsJson,
-    run: async values => {
-      for await (const _ of values);
-    },
-  },
-  {
-    name: 'skip everything, bytes',
-    text: recordsJson,
-    bytes: true,
+    json: recordsJson,
     run: async values => {
       for await (const _ of values);
     },
   },
   {
     name: 'stream long strings',
-    text: longStrings,
+    json: longStrings,
     run: async values => {
       let n = 0;
       for await (const v of values) {
@@ -184,7 +163,25 @@ const workloads: Workload[] = [
       return n;
     },
   },
+  { name: 'parse each array element, text', json: recordsJson, text: true, run: parseEach },
+  { name: 'select one field per element, text', json: recordsJson, text: true, run: selectIds },
 ];
+
+/** Whether the library accepts bytes. Earlier versions only accepted text. */
+async function acceptsBytes(): Promise<boolean> {
+  try {
+    for await (const v of parseValues(stream([new Uint8Array([49])]))) await v.parse();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Decodes bytes for a library that only accepts text, as its users must. */
+async function* decode(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
+  const decoder = new TextDecoder();
+  for await (const chunk of chunks) yield decoder.decode(chunk, { stream: true });
+}
 
 const RUNS = 7;
 const ROUNDS = 5;
@@ -194,8 +191,9 @@ function measure(name: string, lib?: string): number {
   const env = { ...process.env, JSONST_WORKLOAD: name, JSONST_LIB: lib };
   try {
     return Number(execFileSync(process.execPath, [import.meta.filename], { env, encoding: 'utf8', stdio: 'pipe' }));
-  } catch {
-    return NaN; // The library at the base doesn't support this workload.
+  } catch (error) {
+    console.error(String(error));
+    return NaN;
   }
 }
 
@@ -206,16 +204,18 @@ function median(xs: number[]): number {
 const only = process.env.JSONST_WORKLOAD;
 
 if (only !== undefined) {
-  const { text, chunkSize = 65536, bytes, run } = workloads.find(w => w.name === only)!;
-  const input: (string | Uint8Array)[] = bytes ? chunks(new TextEncoder().encode(text), chunkSize) : chunks(text, chunkSize);
+  const { json, chunkSize = 65536, text, run } = workloads.find(w => w.name === only)!;
+  const bytes = !text && await acceptsBytes();
+  const input = text ? chunks(json, chunkSize) : chunks(new TextEncoder().encode(json), chunkSize);
   let best = Infinity;
   for (let i = 0; i < RUNS; i++) {
     const start = process.threadCpuUsage();
-    await run(parseValues(stream(input)));
+    const source = text || bytes ? stream<string | Uint8Array>(input) : decode(stream(input as Uint8Array[]));
+    await run(parseValues(source));
     const { user, system } = process.threadCpuUsage(start);
     best = Math.min(best, (user + system) / 1e3);
   }
-  console.log(text.length / 1e6 / (best / 1e3));
+  console.log(json.length / 1e6 / (best / 1e3));
 } else {
   const args = process.argv.slice(2);
   const baseIndex = args.indexOf('--base');
