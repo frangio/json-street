@@ -359,7 +359,7 @@ class Value implements JsonStValue {
       text = await text;
     }
     this.#state = DONE;
-    return JSON.parse(text);
+    return this.#first === QUOTE ? decodeString(text.slice(1, -1)) : JSON.parse(text);
   }
 
   stringChunks(): AsyncIterable<string> {
@@ -383,7 +383,7 @@ class Value implements JsonStValue {
           held = raw.slice(end);
           raw = raw.slice(0, end);
         }
-        if (raw.length > 0) return JSON.parse('"' + raw + '"') as string;
+        if (raw.length > 0) return decodeString(raw);
       }
       this.#state = DONE;
       return undefined;
@@ -557,6 +557,12 @@ const TYPE_NAMES: Record<number, string> = { [QUOTE]: 'string', [LBRACKET]: 'arr
 
 function typeName(first: number): string {
   return TYPE_NAMES[first] ?? 'number, boolean, or null';
+}
+
+/** Decodes the raw contents of a string, which has to be complete. */
+function decodeString(raw: string): string {
+  // Most strings have nothing to decode or reject.
+  return /[\\\u0000-\u001f]/.test(raw) ? JSON.parse('"' + raw + '"') : raw;
 }
 
 /**

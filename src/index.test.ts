@@ -274,8 +274,9 @@ test('object values may be read before keys', async () => {
 });
 
 test('syntax errors', async () => {
-  for (const text of ['[1,]', '[1 2]', '{"a" 1}', '{"a":1,}', '{1:2}', '[', '"abc', ']', '{"a"}', '[,1]']) {
+  for (const text of ['[1,]', '[1 2]', '{"a" 1}', '{"a":1,}', '{1:2}', '[', '"abc', ']', '{"a"}', '[,1]', '"a\tb"', '{"\u0001":1}']) {
     await assert.rejects(readAll([text], read), SyntaxError, text);
+    await assert.rejects(readAll([text], v => v.parse()), SyntaxError, text);
   }
 });
 
