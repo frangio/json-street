@@ -324,17 +324,37 @@ function exitContainer(input: Input, depth: number): number | Promise<number> {
   }
 }
 
-/** Consumes the value that starts at the next token, returning its text. */
-function valueText(input: Input): string | Promise<string> {
+/**
+ * Consumes the value that starts at the next token, returning it parsed.
+ * Returns a promise if it has to wait for input.
+ */
+function parseValue(input: Input): unknown {
   input.mark = input.tokens[input.cursor]!;
   const end = consumeValue(input);
-  return typeof end === 'number' ? takeText(input, end) : end.then(end => takeText(input, end));
+  return typeof end === 'number' ? parseMarked(input, end) : end.then(end => parseMarked(input, end));
 }
 
-function takeText(input: Input, end: number): string {
-  const text = decodeText(input.bytes, input.mark, end);
+function parseMarked(input: Input, end: number): unknown {
+  const { bytes, mark } = input;
   input.mark = NONE;
-  return text;
+  return bytes[mark] === QUOTE ? decodeString(bytes, mark + 1, end - 1) : JSON.parse(decodeText(bytes, mark, end));
+}
+
+/**
+ * Decodes the contents of a string at [start, end), which must be complete.
+ * Short strings without escapes are decoded in one pass in JavaScript.
+ */
+function decodeString(bytes: Uint8Array, start: number, end: number): string {
+  if (end - start <= 16) {
+    let text = '';
+    for (let i = start; i < end; i++) {
+      const c = bytes[i]!;
+      if (c >= 0x80 || c === BACKSLASH || c < 0x20) return unescape(decodeText(bytes, start, end));
+      text += String.fromCharCode(c);
+    }
+    return text;
+  }
+  return unescape(decodeText(bytes, start, end));
 }
 
 /**
@@ -379,8 +399,8 @@ class Value implements JsonStValue {
   #entered = false;
   /** The element last yielded while iterating an array or object. */
   #child: Value | undefined;
-  /** The text being captured by parse. */
-  #capture: Promise<string> | undefined;
+  /** The parse in progress, while it waits for input. */
+  #capture: Promise<unknown> | undefined;
 
   constructor(input: Input, key?: Value) {
     this.#input = input;
@@ -390,13 +410,13 @@ class Value implements JsonStValue {
   async parse(): Promise<unknown> {
     this.#claim();
     const started = this.#start();
-    let text = started ? started.then(() => valueText(this.#input)) : valueText(this.#input);
-    if (typeof text !== 'string') {
-      this.#capture = text;
-      text = await text;
+    let value = started ? started.then(() => parseValue(this.#input)) : parseValue(this.#input);
+    if (value instanceof Promise) {
+      this.#capture = value;
+      value = await value;
     }
     this.#state = DONE;
-    return this.#first === QUOTE ? decodeString(text.slice(1, -1)) : JSON.parse(text);
+    return value;
   }
 
   stringChunks(): AsyncIterable<string> {
@@ -422,10 +442,16 @@ class Value implements JsonStValue {
         if (c === MORE && input.mark === input.len) return more(input).then(step);
         closed = c !== MORE;
         const end = closed ? input.tokens[input.cursor]! : input.len;
-        let raw = held + (closed && partial === undefined
-          ? decodeText(input.bytes, input.mark, end)
-          : (partial ??= new TextDecoder('utf-8', { ignoreBOM: true }))
-            .decode(input.bytes.subarray(input.mark, end), { stream: !closed }));
+        if (closed && partial === undefined) {
+          // The whole string arrived at once.
+          const text = decodeString(input.bytes, input.mark, end);
+          input.cursor++;
+          input.mark = NONE;
+          this.#state = DONE;
+          return text.length > 0 ? text : undefined;
+        }
+        partial ??= new TextDecoder('utf-8', { ignoreBOM: true });
+        let raw = held + partial.decode(input.bytes.subarray(input.mark, end), { stream: !closed });
         held = '';
         if (closed) {
           input.cursor++;
@@ -437,7 +463,7 @@ class Value implements JsonStValue {
           held = raw.slice(complete);
           raw = raw.slice(0, complete);
         }
-        if (raw.length > 0) return decodeString(raw);
+        if (raw.length > 0) return unescape(raw);
         if (closed) return undefined;
       }
     };
@@ -609,8 +635,8 @@ function typeName(first: number): string {
   return TYPE_NAMES[first] ?? 'number, boolean, or null';
 }
 
-/** Decodes the raw contents of a string, which has to be complete. */
-function decodeString(raw: string): string {
+/** Decodes the escapes in the raw contents of a string, which must be complete. */
+function unescape(raw: string): string {
   // Most strings have nothing to decode or reject.
   return /[\\\u0000-\u001f]/.test(raw) ? JSON.parse('"' + raw + '"') : raw;
 }
