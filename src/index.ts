@@ -332,9 +332,26 @@ function valueText(input: Input): string | Promise<string> {
 }
 
 function takeText(input: Input, end: number): string {
-  const text = decoder.decode(input.bytes.subarray(input.mark, end));
+  const text = decodeText(input.bytes, input.mark, end);
   input.mark = NONE;
   return text;
+}
+
+/**
+ * Decodes the UTF-8 bytes at [start, end). Short ASCII text is decoded in
+ * JavaScript, avoiding the fixed cost of calling TextDecoder.
+ */
+function decodeText(bytes: Uint8Array, start: number, end: number): string {
+  if (end - start <= 16) {
+    let text = '';
+    for (let i = start; i < end; i++) {
+      const c = bytes[i]!;
+      if (c >= 0x80) return decoder.decode(bytes.subarray(start, end));
+      text += String.fromCharCode(c);
+    }
+    return text;
+  }
+  return decoder.decode(bytes.subarray(start, end));
 }
 
 /** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
@@ -405,10 +422,10 @@ class Value implements JsonStValue {
         if (c === MORE && input.mark === input.len) return more(input).then(step);
         closed = c !== MORE;
         const end = closed ? input.tokens[input.cursor]! : input.len;
-        const bytes = input.bytes.subarray(input.mark, end);
         let raw = held + (closed && partial === undefined
-          ? decoder.decode(bytes)
-          : (partial ??= new TextDecoder('utf-8', { ignoreBOM: true })).decode(bytes, { stream: !closed }));
+          ? decodeText(input.bytes, input.mark, end)
+          : (partial ??= new TextDecoder('utf-8', { ignoreBOM: true }))
+            .decode(input.bytes.subarray(input.mark, end), { stream: !closed }));
         held = '';
         if (closed) {
           input.cursor++;
