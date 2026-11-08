@@ -25,10 +25,14 @@ export async function* parseValues(stream: AsyncIterable<string>): AsyncIterable
   const input = new Input(stream[Symbol.asyncIterator]());
   let value: Value | undefined;
   try {
-    while ((await input.peek()) !== EOF) {
+    for (;;) {
+      let c = input.peek();
+      if (c === MORE) c = await input.peekAsync();
+      if (c === EOF) break;
       value = new Value(input);
       yield value;
-      await value.finish();
+      const finished = value.finish();
+      if (finished) await finished;
     }
   } finally {
     // The consumer may stop iterating while a parse is in progress, as in
@@ -39,6 +43,8 @@ export async function* parseValues(stream: AsyncIterable<string>): AsyncIterable
 }
 
 const EOF = -1;
+/** Returned by `Input.peek` when it needs to wait for the next chunk. */
+const MORE = -2;
 const TAB = 9, LF = 10, CR = 13, SPACE = 32;
 const QUOTE = 34, COMMA = 44, COLON = 58, BACKSLASH = 92;
 const LBRACKET = 91, RBRACKET = 93, LBRACE = 123, RBRACE = 125;
@@ -67,6 +73,7 @@ class Input {
   #chunks: AsyncIterator<string>;
   #buf = '';
   #pos = 0;
+  #ended = false;
 
   // Scanner state.
   #depth = 0;
@@ -77,22 +84,37 @@ class Input {
     this.#chunks = chunks;
   }
 
-  /** Skips whitespace and returns the next character, or EOF. */
-  async peek(): Promise<number> {
-    for (;;) {
-      while (this.#pos < this.#buf.length) {
-        const c = this.#buf.charCodeAt(this.#pos);
-        if (!isWhitespace(c)) return c;
-        this.#pos++;
+  // Methods that may have to wait for input return a promise only when they
+  // do, to avoid the cost of awaiting when the input is already buffered.
+
+  /**
+   * Skips whitespace and returns the next character, EOF, or MORE if the
+   * buffered input ran out (see peekAsync).
+   */
+  peek(): number {
+    const buf = this.#buf;
+    let pos = this.#pos;
+    while (pos < buf.length) {
+      const c = buf.charCodeAt(pos);
+      if (!isWhitespace(c)) {
+        this.#pos = pos;
+        return c;
       }
-      if (!(await this.#fill())) return EOF;
+      pos++;
     }
+    this.#pos = pos;
+    return this.#ended ? EOF : MORE;
   }
 
-  /** Consumes the character returned by peek, which must be `c`. */
-  async expect(c: number): Promise<void> {
-    const next = await this.peek();
-    if (next !== c) throw unexpected(next);
+  /** Like peek, but waits for input instead of returning MORE. */
+  async peekAsync(): Promise<number> {
+    let c;
+    while ((c = this.peek()) === MORE) await this.#fill();
+    return c;
+  }
+
+  /** Consumes the character returned by peek. */
+  advance(): void {
     this.#pos++;
   }
 
@@ -109,7 +131,7 @@ class Input {
    * Consumes the value that starts at the peeked character, returning its
    * text if `capture` is true.
    */
-  async value(capture: boolean): Promise<string> {
+  value(capture: boolean): string | Promise<string> {
     const c = this.#buf.charCodeAt(this.#pos);
     const start = this.#pos;
     if (c === QUOTE || c === LBRACKET || c === LBRACE) {
@@ -122,15 +144,15 @@ class Input {
   }
 
   /** Skips the rest of the array or object entered last, between elements. */
-  async exitContainer(): Promise<void> {
+  exitContainer(): string | Promise<string> {
     this.#inString = false;
     this.#depth = 1;
-    await this.#scan(this.#pos, false);
+    return this.#scan(this.#pos, false);
   }
 
   /** Skips the rest of the string entered last. */
-  async exitString(): Promise<void> {
-    await this.#scan(this.#pos, false);
+  exitString(): string | Promise<string> {
+    return this.#scan(this.#pos, false);
   }
 
   /**
@@ -158,22 +180,28 @@ class Input {
     const { done, value } = await this.#chunks.next();
     this.#buf = done ? '' : value;
     this.#pos = 0;
+    this.#ended = !!done;
     return !done;
   }
 
-  async #scan(start: number, capture: boolean): Promise<string> {
-    let parts: string[] = [];
-    while (!this.#scanChunk()) {
-      if (capture) parts.push(this.#buf.slice(start));
-      start = 0;
+  #scan(start: number, capture: boolean): string | Promise<string> {
+    if (this.#scanChunk()) return capture ? this.#buf.slice(start, this.#pos) : '';
+    return this.#scanAsync(capture ? [this.#buf.slice(start)] : undefined);
+  }
+
+  async #scanAsync(parts: string[] | undefined): Promise<string> {
+    for (;;) {
       if (!(await this.#fill())) {
         if (this.#inString || this.#depth > 0) throw unexpected(EOF);
         break;
       }
+      if (this.#scanChunk()) {
+        parts?.push(this.#buf.slice(0, this.#pos));
+        break;
+      }
+      parts?.push(this.#buf);
     }
-    if (!capture) return '';
-    parts.push(this.#buf.slice(start, this.#pos));
-    return parts.join('');
+    return parts?.join('') ?? '';
   }
 
   /**
@@ -262,8 +290,12 @@ class Value implements JsonStValue {
 
   async parse(): Promise<unknown> {
     this.#claim();
-    this.#capture = this.#start().then(() => this.#input.value(true));
-    const text = await this.#capture;
+    const started = this.#start();
+    let text = started ? started.then(() => this.#input.value(true)) : this.#input.value(true);
+    if (typeof text !== 'string') {
+      this.#capture = text;
+      text = await text;
+    }
     this.#state = DONE;
     return JSON.parse(text);
   }
@@ -290,26 +322,31 @@ class Value implements JsonStValue {
   async *arrayValues(): AsyncIterable<JsonStValue> {
     await this.#enter(LBRACKET);
     const input = this.#input;
-    if ((await input.peek()) !== RBRACKET) {
+    let c = input.peek();
+    if (c === MORE) c = await input.peekAsync();
+    if (c !== RBRACKET) {
       for (;;) {
         const child = this.#child = new Value(input);
         yield child;
         this.#checkActive();
-        await child.finish();
-        const c = await input.peek();
+        const finished = child.finish();
+        if (finished) await finished;
+        c = input.peek();
+        if (c === MORE) c = await input.peekAsync();
         if (c === RBRACKET) break;
         if (c !== COMMA) throw unexpected(c);
-        await input.expect(COMMA);
+        input.advance();
       }
     }
-    await input.expect(RBRACKET);
+    input.advance();
     this.#state = DONE;
   }
 
   async *objectEntries(): AsyncIterable<[key: JsonStValue, value: JsonStValue]> {
     await this.#enter(LBRACE);
     const input = this.#input;
-    let c = await input.peek();
+    let c = input.peek();
+    if (c === MORE) c = await input.peekAsync();
     if (c !== RBRACE) {
       for (;;) {
         if (c !== QUOTE) throw unexpected(c);
@@ -317,39 +354,44 @@ class Value implements JsonStValue {
         const value = this.#child = new Value(input, key);
         yield [key, value];
         this.#checkActive();
-        await value.finish();
-        c = await input.peek();
+        const finished = value.finish();
+        if (finished) await finished;
+        c = input.peek();
+        if (c === MORE) c = await input.peekAsync();
         if (c === RBRACE) break;
         if (c !== COMMA) throw unexpected(c);
-        await input.expect(COMMA);
-        c = await input.peek();
+        input.advance();
+        c = input.peek();
+        if (c === MORE) c = await input.peekAsync();
       }
     }
-    await input.expect(RBRACE);
+    input.advance();
     this.#state = DONE;
   }
 
-  /** Consumes whatever part of the value has not been consumed yet. */
-  async finish(): Promise<void> {
-    if (this.#state === PENDING) {
-      this.#claim();
-      await this.#start();
-      await this.#input.value(false);
-    } else if (this.#state === ACTIVE) {
-      if (this.#capture !== undefined) {
-        await this.parsed();
-      } else if (!this.#entered) {
-        // An iterator is about to start; nothing has been consumed yet.
-        await this.#start();
-        await this.#input.value(false);
-      } else if (this.#first === QUOTE) {
-        await this.#input.exitString();
-      } else {
-        await this.#child?.finish();
-        await this.#input.exitContainer();
-      }
-    }
+  /**
+   * Consumes whatever part of the value has not been consumed yet. Returns a
+   * promise if it has to wait for input.
+   */
+  finish(): Promise<unknown> | undefined {
+    const state = this.#state;
+    if (state === DONE) return;
     this.#state = DONE;
+    const input = this.#input;
+    let result: string | Promise<unknown> | undefined;
+    if (this.#capture !== undefined) {
+      result = this.parsed();
+    } else if (!this.#entered) {
+      // Nothing has been consumed yet (an iterator may be about to start).
+      const started = this.#start();
+      result = started ? started.then(() => input.value(false)) : input.value(false);
+    } else if (this.#first === QUOTE) {
+      result = input.exitString();
+    } else {
+      const finished = this.#child?.finish();
+      result = finished ? finished.then(() => input.exitContainer()) : input.exitContainer();
+    }
+    return typeof result === 'string' ? undefined : result;
   }
 
   /** Waits until a parse in progress, if any, has consumed its input. */
@@ -366,15 +408,25 @@ class Value implements JsonStValue {
     if (this.#state !== ACTIVE) throw new Error('JSON value skipped before it was consumed');
   }
 
-  /** Moves the input to the first character of the value. */
-  async #start(): Promise<void> {
+  /**
+   * Moves the input to the first character of the value. Returns a promise if
+   * it has to wait for input.
+   */
+  #start(): Promise<void> | undefined {
     if (this.#first !== EOF) return;
+    const input = this.#input;
     const key = this.#key;
     if (key !== undefined) {
-      await key.finish();
-      await this.#input.expect(COLON);
+      const finished = key.finish();
+      if (finished) return finished.then(() => this.#start());
+      const c = input.peek();
+      if (c === MORE) return input.peekAsync().then(() => this.#start());
+      if (c !== COLON) throw unexpected(c);
+      input.advance();
+      this.#key = undefined;
     }
-    const c = await this.#input.peek();
+    const c = input.peek();
+    if (c === MORE) return input.peekAsync().then(() => this.#start());
     if (c === EOF || c === COMMA || c === COLON || c === RBRACKET || c === RBRACE) {
       throw unexpected(c);
     }
@@ -384,7 +436,8 @@ class Value implements JsonStValue {
   /** Enters the value, which must start with `open`. */
   async #enter(open: number): Promise<void> {
     this.#claim();
-    await this.#start();
+    const started = this.#start();
+    if (started) await started;
     if (this.#first !== open) {
       this.#state = PENDING;
       throw new TypeError(`Expected JSON ${TYPE_NAMES[open]}, found ${typeName(this.#first)}`);
