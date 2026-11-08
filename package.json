@@ -19,14 +19,16 @@
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "check": "tsc",
+    "check": "tsc && node scripts/wasm.ts --check",
     "test": "node --test 'src/**/*.test.ts'",
     "bench": "node bench/bench.ts",
+    "wasm": "node scripts/wasm.ts",
     "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
     "fast-check": "^4.10.2",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "wabt": "^1.0.39"
   }
 }

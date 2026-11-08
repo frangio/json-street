@@ -104,7 +104,6 @@ class Items<T> implements AsyncIterableIterator<T> {
 const EOF = -1;
 /** Returned by `peek` when it needs to wait for more input. */
 const MORE = -2;
-const TAB = 9, LF = 10, CR = 13, SPACE = 32;
 const QUOTE = 34, COMMA = 44, COLON = 58, BACKSLASH = 92;
 const LBRACKET = 91, RBRACKET = 93, LBRACE = 123, RBRACE = 125;
 
@@ -126,8 +125,11 @@ const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 // The kind of a token is the byte it points to. A number, boolean, or null
 // ends at the next token or the end of the stream.
 
-/** Tokenizer state: inside a string, after a backslash, inside a scalar. */
-const IN_STRING = 1, ESCAPED = 2, IN_SCALAR = 4;
+/**
+ * Tokenizer state: inside a string, after an odd number of backslashes,
+ * inside a scalar.
+ */
+const IN_STRING = 1;
 
 /**
  * Tokenizes the bytes at [pos, end) starting in `state`, writing the tokens
@@ -139,6 +141,8 @@ type Tokenize = (state: number, pos: number, end: number, out: number) => number
 /** Words in the token region at the start of memory, followed by bytes. */
 const TOKENS = 16384;
 const BYTES = TOKENS * 4;
+/** Bytes past the buffered ones that the tokenizer may read. */
+const SLACK = 64;
 const PAGE = 65536;
 const NONE = Infinity;
 
@@ -256,6 +260,7 @@ function append(input: Input, chunk: Uint8Array | string): void {
  * or growing the memory. Must be called with every token consumed.
  */
 function reserve(input: Input, n: number): void {
+  n += SLACK;
   if (input.len + n <= input.bytes.length) return;
   const keep = Math.min(input.mark, input.scanned);
   const shift = keep - BYTES;
@@ -332,39 +337,14 @@ function takeText(input: Input, end: number): string {
   return text;
 }
 
-/** A tokenizer written in JavaScript, operating on `memory`. */
+/** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
+const TOKENIZER = 'AGFzbQEAAAABEQJgAX8Efn5+fmAEf39/fwF/Ag8BA2VudgZtZW1vcnkCAAEDAwIAAQcMAQh0b2tlbml6ZQABCpwFAs8BBAF/AX4DewR+A0AgACABav0ABAAhAyADQSD9D/1QIQQgA0Es/Q/9IyADQTr9D/0j/VAgBEH7AP0P/SMgBEH9AP0P/SP9UP1QIQUgAa0hAiAGIANBIv0P/SP9ZK0gAoaEIQYgByADQdwA/Q/9I/1krSAChoQhByAIIAX9ZK0gAoaEIQggCSAFIANBIP0P/SMgA0EJ/Q/9I/1QIANBCv0P/SMgA0EN/Q/9I/1Q/VD9UP1krSAChoQhCSABQRBqIgFBwABJDQALIAYgByAIIAkLyAMCAn8QfiADIQQgAEEBca0hDCAAQQF2QQFxrSENIABBAnatIQ4CQANAIAEgAk8NASACIAFrIQUgBUHAAE8EQEHAACEFQn8hBwVCASAFrYZCAX0hBwsgBUEBa60hBiABEAAhCyEKIQkhCCAJIAeDIQkgCSAJQgGGQn+FgyEPQtWq1arVqtWq1QAgDYUhECAJIA8gEEJ/hYN8IREgCUJ/hSAJIA8gEIN8QqrVqtWq1arVqn+DIBEgDYRC1arVqtWq1arVAIOEgyESIBEgCVStIBIgBa2IQgGDIAVBwABGGyENIAggB4MgEkJ/hYMhCCAIIRMgEyATQgGGhSETIBMgE0IChoUhEyATIBNCBIaFIRMgEyATQgiGhSETIBMgE0IQhoUhEyATIBNCIIaFIRMgE0IAIAx9hSETIBMgBohCAYMhDCAHIAggC4QgE4RCf4WDIRQgCCAKIAeDIBNCf4WDhCAUIBRCAYYgDoRCf4WDhCEVIBQgBohCAYMhDgJAA0AgFVANASADIAEgFXqnajYCACADQQRqIQMgFSAVQgF9gyEVDAALCyABQcAAaiEBDAALCyADIARrQQF0IAwgDUIBhoQgDkIChoSncgs=';
+
+const tokenizerModule = new WebAssembly.Module(Uint8Array.from(atob(TOKENIZER), c => c.charCodeAt(0)));
+
+/** Instantiates the tokenizer to operate on `memory`. */
 function tokenizer(memory: WebAssembly.Memory): Tokenize {
-  return (state, pos, end, out) => {
-    const bytes = new Uint8Array(memory.buffer);
-    const tokens = new Uint32Array(memory.buffer);
-    let n = out >> 2;
-    const first = n;
-    let inString = state & IN_STRING, escaped = state & ESCAPED, inScalar = state & IN_SCALAR;
-    for (; pos < end; pos++) {
-      const c = bytes[pos]!;
-      if (inString) {
-        if (escaped) {
-          escaped = 0;
-        } else if (c === BACKSLASH) {
-          escaped = ESCAPED;
-        } else if (c === QUOTE) {
-          inString = 0;
-          tokens[n++] = pos;
-        }
-      } else if (c === SPACE || c === LF || c === CR || c === TAB) {
-        inScalar = 0;
-      } else if (c === QUOTE || c === COMMA || c === COLON
-        || c === LBRACKET || c === RBRACKET || c === LBRACE || c === RBRACE) {
-        inString = c === QUOTE ? IN_STRING : 0;
-        inScalar = 0;
-        tokens[n++] = pos;
-      } else if (!inScalar) {
-        inScalar = IN_SCALAR;
-        tokens[n++] = pos;
-      }
-    }
-    return (n - first) * 8 + (inString | escaped | inScalar);
-  };
+  return new WebAssembly.Instance(tokenizerModule, { env: { memory } }).exports.tokenize as Tokenize;
 }
 
 // VALUES /////////////////////////////////////////////////////////////////////

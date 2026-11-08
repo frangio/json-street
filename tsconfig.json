@@ -11,5 +11,5 @@
     "types": ["node"],
     "noEmit": true
   },
-  "include": ["src", "bench"]
+  "include": ["src", "bench", "scripts"]
 }
