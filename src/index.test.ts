@@ -176,7 +176,9 @@ test('unconsumed and partially consumed values are skipped', async () => {
     }
   }
 
-  const values = fc.array(fc.jsonValue({ stringUnit: 'binary' }), { maxLength: 3 });
+  // Round-trip through JSON to normalize values like -0.
+  const values = fc.array(fc.jsonValue({ stringUnit: 'binary' }), { maxLength: 3 })
+    .map(values => values.map(v => JSON.parse(JSON.stringify(v))));
   await fc.assert(fc.asyncProperty(values, cuts, strategies, async (values, cuts, plans) => {
     const text = values.map(v => JSON.stringify(v)).join('\n');
     const plan = (): Iterator<Strategy> => {
