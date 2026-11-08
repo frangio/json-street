@@ -52,13 +52,13 @@ const recordsJson = JSON.stringify(records);
 const ndjson = records.map(r => JSON.stringify(r)).join('\n');
 const longStrings = JSON.stringify(Array.from({ length: 20 }, () => text(SIZE / 20 / 6)));
 
-function chunks(text: string, size: number): string[] {
+function chunks<T extends string | Uint8Array>(text: T, size: number): T[] {
   const result = [];
-  for (let i = 0; i < text.length; i += size) result.push(text.slice(i, i + size));
+  for (let i = 0; i < text.length; i += size) result.push(text.slice(i, i + size) as T);
   return result;
 }
 
-async function* stream(chunks: string[]): AsyncGenerator<string> {
+async function* stream<T>(chunks: T[]): AsyncGenerator<T> {
   yield* chunks;
 }
 
@@ -83,7 +83,7 @@ async function read(value: JsonStValue, expected: unknown): Promise<unknown> {
   }
 }
 
-type Workload = { name: string; text: string; chunkSize?: number; run: (values: AsyncIterable<JsonStValue>) => Promise<unknown> };
+type Workload = { name: string; text: string; chunkSize?: number; bytes?: boolean; run: (values: AsyncIterable<JsonStValue>) => Promise<unknown> };
 
 const workloads: Workload[] = [
   {
@@ -111,6 +111,16 @@ const workloads: Workload[] = [
     name: 'parse each array element, 1 KB chunks',
     text: recordsJson,
     chunkSize: 1024,
+    run: async values => {
+      const items = [];
+      for await (const v of values) for await (const item of v.arrayValues()) items.push(await item.parse());
+      return items;
+    },
+  },
+  {
+    name: 'parse each array element, bytes',
+    text: recordsJson,
+    bytes: true,
     run: async values => {
       const items = [];
       for await (const v of values) for await (const item of v.arrayValues()) items.push(await item.parse());
@@ -156,6 +166,14 @@ const workloads: Workload[] = [
     },
   },
   {
+    name: 'skip everything, bytes',
+    text: recordsJson,
+    bytes: true,
+    run: async values => {
+      for await (const _ of values);
+    },
+  },
+  {
     name: 'stream long strings',
     text: longStrings,
     run: async values => {
@@ -174,7 +192,11 @@ const ROUNDS = 5;
 /** Runs a workload in a child process and returns its throughput in MB/s. */
 function measure(name: string, lib?: string): number {
   const env = { ...process.env, JSONST_WORKLOAD: name, JSONST_LIB: lib };
-  return Number(execFileSync(process.execPath, [import.meta.filename], { env, encoding: 'utf8' }));
+  try {
+    return Number(execFileSync(process.execPath, [import.meta.filename], { env, encoding: 'utf8', stdio: 'pipe' }));
+  } catch {
+    return NaN; // The library at the base doesn't support this workload.
+  }
 }
 
 function median(xs: number[]): number {
@@ -184,8 +206,8 @@ function median(xs: number[]): number {
 const only = process.env.JSONST_WORKLOAD;
 
 if (only !== undefined) {
-  const { text, chunkSize = 65536, run } = workloads.find(w => w.name === only)!;
-  const input = chunks(text, chunkSize);
+  const { text, chunkSize = 65536, bytes, run } = workloads.find(w => w.name === only)!;
+  const input: (string | Uint8Array)[] = bytes ? chunks(new TextEncoder().encode(text), chunkSize) : chunks(text, chunkSize);
   let best = Infinity;
   for (let i = 0; i < RUNS; i++) {
     const start = process.threadCpuUsage();
@@ -218,6 +240,7 @@ if (only !== undefined) {
       after.push(measure(name));
     }
     const change = (median(after) / median(before) - 1) * 100;
-    console.log(`${name.padEnd(40)} ${fmt(median(before))} ${fmt(median(after))} ${(change >= 0 ? '+' : '') + change.toFixed(1).padStart(6)}%`);
+    const changeText = Number.isNaN(change) ? 'n/a' : (change >= 0 ? '+' : '') + change.toFixed(1) + '%';
+    console.log(`${name.padEnd(40)} ${fmt(median(before))} ${fmt(median(after))} ${changeText.padStart(8)}`);
   }
 }

@@ -3,13 +3,17 @@ import assert from 'node:assert/strict';
 import fc from 'fast-check';
 import { parseValues, type JsonStValue } from './index.ts';
 
-async function* stream(...chunks: string[]): AsyncGenerator<string> {
+type Chunk = string | Uint8Array;
+
+async function* stream<T>(...chunks: T[]): AsyncGenerator<T> {
   yield* chunks;
 }
 
-function split(text: string, cuts: number[]): string[] {
-  const points = [...new Set(cuts.map(c => c % (text.length + 1)))].sort((a, b) => a - b);
-  return [...points, text.length].map((end, i) => text.slice(points[i - 1] ?? 0, end));
+/** Splits text at the cuts, as text or as UTF-8 bytes (possibly inside characters). */
+function split(text: string, cuts: number[], bytes = false): Chunk[] {
+  const whole = bytes ? new TextEncoder().encode(text) : text;
+  const points = [...new Set(cuts.map(c => c % (whole.length + 1)))].sort((a, b) => a - b);
+  return [...points, whole.length].map((end, i) => whole.slice(points[i - 1] ?? 0, end));
 }
 
 async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
@@ -46,7 +50,7 @@ async function read(value: JsonStValue): Promise<unknown> {
   return value.parse();
 }
 
-async function readAll(chunks: string[], read: (v: JsonStValue) => Promise<unknown>): Promise<unknown[]> {
+async function readAll(chunks: Chunk[], read: (v: JsonStValue) => Promise<unknown>): Promise<unknown[]> {
   const values = [];
   for await (const value of parseValues(stream(...chunks))) values.push(await read(value));
   return values;
@@ -60,14 +64,14 @@ const json = fc.record({
 const cuts = fc.array(fc.nat(), { maxLength: 20 });
 
 test('streaming methods agree with JSON.parse', async () => {
-  await fc.assert(fc.asyncProperty(json, cuts, async (text, cuts) => {
-    assert.deepEqual(await readAll(split(text, cuts), read), [JSON.parse(text)]);
+  await fc.assert(fc.asyncProperty(json, cuts, fc.boolean(), async (text, cuts, bytes) => {
+    assert.deepEqual(await readAll(split(text, cuts, bytes), read), [JSON.parse(text)]);
   }));
 });
 
 test('parse agrees with JSON.parse', async () => {
-  await fc.assert(fc.asyncProperty(json, cuts, async (text, cuts) => {
-    assert.deepEqual(await readAll(split(text, cuts), v => v.parse()), [JSON.parse(text)]);
+  await fc.assert(fc.asyncProperty(json, cuts, fc.boolean(), async (text, cuts, bytes) => {
+    assert.deepEqual(await readAll(split(text, cuts, bytes), v => v.parse()), [JSON.parse(text)]);
   }));
 });
 
@@ -83,16 +87,17 @@ test('arbitrary input is accepted exactly when JSON.parse accepts it', async () 
     }),
     fc.string({ unit: fc.constantFrom(...' "\\u0a[]{},:1') }),
   );
-  await fc.assert(fc.asyncProperty(input, cuts, fc.boolean(), async (text, cuts, streaming) => {
+  await fc.assert(fc.asyncProperty(input, cuts, fc.boolean(), fc.boolean(), async (text, cuts, streaming, bytes) => {
     let expected: unknown[];
     try {
-      expected = [JSON.parse(text)];
+      // Lone surrogates can't be encoded as UTF-8, so they become U+FFFD.
+      expected = [JSON.parse(text.toWellFormed())];
     } catch {
       expected = [];
     }
     let actual: unknown[];
     try {
-      actual = await readAll(split(text, cuts), streaming ? read : v => v.parse());
+      actual = await readAll(split(text, cuts, bytes), streaming ? read : v => v.parse());
     } catch (e) {
       assert(e instanceof SyntaxError, e as Error);
       actual = [];
@@ -179,14 +184,14 @@ test('unconsumed and partially consumed values are skipped', async () => {
   // Round-trip through JSON to normalize values like -0.
   const values = fc.array(fc.jsonValue({ stringUnit: 'binary' }), { maxLength: 3 })
     .map(values => values.map(v => JSON.parse(JSON.stringify(v))));
-  await fc.assert(fc.asyncProperty(values, cuts, strategies, async (values, cuts, plans) => {
+  await fc.assert(fc.asyncProperty(values, cuts, strategies, fc.boolean(), async (values, cuts, plans, bytes) => {
     const text = values.map(v => JSON.stringify(v)).join('\n');
     const plan = (): Iterator<Strategy> => {
       let i = 0;
       return { next: () => ({ value: plans[i++ % plans.length]! }) };
     };
     const it = values[Symbol.iterator]();
-    const actual = await readAll(split(text, cuts), v => consume(v, plan(), it.next().value));
+    const actual = await readAll(split(text, cuts, bytes), v => consume(v, plan(), it.next().value));
     assert.deepEqual(
       actual.map((a, i) => erasePartialStrings(a, values[i], plan())),
       values.map(v => expectedParts(v, plan())),
@@ -203,6 +208,53 @@ test('every split of tricky input', async () => {
       assert.deepEqual(await readAll(chunks, read), expected, chunks.join('|'));
       assert.deepEqual(await readAll(chunks, v => v.parse()), expected, chunks.join('|'));
     }
+  }
+});
+
+test('every split of non-ASCII bytes', async () => {
+  const text = '["é😀", {"€": "aé"}]';
+  const expected = [JSON.parse(text)];
+  const length = new TextEncoder().encode(text).length;
+  for (let i = 0; i <= length; i++) {
+    for (let j = i; j <= length; j++) {
+      assert.deepEqual(await readAll(split(text, [i, j], true), read), expected, `${i} ${j}`);
+      assert.deepEqual(await readAll(split(text, [i, j], true), v => v.parse()), expected, `${i} ${j}`);
+    }
+  }
+});
+
+test('long strings with escapes at every offset', async () => {
+  // Exercises scanning that works in blocks of bytes.
+  for (let offset = 0; offset < 70; offset++) {
+    for (const escapes of ['\\\\', '\\\"', '\\"', '\\u00e9\\', '\\\\\\']) {
+      const text = `["${'a'.repeat(offset)}${escapes}${'b'.repeat(70 - offset)}", "${'c'.repeat(offset)}"]`;
+      let expected;
+      try {
+        expected = [JSON.parse(text)];
+      } catch {
+        await assert.rejects(readAll([text], v => v.parse()), SyntaxError);
+        continue;
+      }
+      assert.deepEqual(await readAll([text], read), expected, text);
+      assert.deepEqual(await readAll([text], v => v.parse()), expected, text);
+      assert.deepEqual(await readAll(split(text, [offset + 1, offset + 17], true), read), expected, text);
+    }
+  }
+});
+
+test('large input in small chunks', async () => {
+  // Fills the buffer many times while values that span chunks are in use.
+  const items = Array.from({ length: 3000 }, (_, i) => ({ i, s: 'é😀\\n'.repeat(i % 300) }));
+  const text = JSON.stringify(items);
+  for (const bytes of [false, true]) {
+    const chunks = split(text, Array.from({ length: text.length / 997 }, (_, i) => i * 997), bytes);
+    assert.deepEqual(await readAll(chunks, v => v.parse()), [items]);
+    assert.deepEqual(await readAll(chunks, read), [items]);
+    const parsed = [];
+    for await (const value of parseValues(stream(...chunks))) {
+      for await (const item of value.arrayValues()) parsed.push(await item.parse());
+    }
+    assert.deepEqual(parsed, items);
   }
 });
 

@@ -19,16 +19,17 @@ export interface JsonStValue {
 }
 
 /**
- * Iterates over the whitespace-separated JSON values in a stream of text.
+ * Iterates over the whitespace-separated JSON values in a stream of UTF-8
+ * bytes or text. Chunks may be split anywhere, even inside a character.
  */
-export function parseValues(stream: AsyncIterable<string>): AsyncIterable<JsonStValue> {
-  const input = new Input(stream[Symbol.asyncIterator]());
+export function parseValues(stream: AsyncIterable<Uint8Array | string>): AsyncIterable<JsonStValue> {
+  const input = createInput(stream[Symbol.asyncIterator]());
   let value: Value | undefined;
   const step = (): Step<Value> => {
     const finished = value?.finish();
     if (finished) return finished.then(step);
-    const c = input.peek();
-    if (c === MORE) return input.peekAsync().then(step);
+    const c = peek(input);
+    if (c === MORE) return more(input).then(step);
     if (c === EOF) return undefined;
     return value = new Value(input);
   };
@@ -36,7 +37,7 @@ export function parseValues(stream: AsyncIterable<string>): AsyncIterable<JsonSt
     // The consumer may stop iterating while a parse is in progress, as in
     // `for await (const v of parseValues(s)) return v.parse();`
     await value?.parsed();
-    await input.close();
+    await input.chunks.return?.();
   });
 }
 
@@ -101,21 +102,11 @@ class Items<T> implements AsyncIterableIterator<T> {
 }
 
 const EOF = -1;
-/** Returned by `Input.peek` when it needs to wait for the next chunk. */
+/** Returned by `peek` when it needs to wait for more input. */
 const MORE = -2;
 const TAB = 9, LF = 10, CR = 13, SPACE = 32;
 const QUOTE = 34, COMMA = 44, COLON = 58, BACKSLASH = 92;
 const LBRACKET = 91, RBRACKET = 93, LBRACE = 123, RBRACE = 125;
-
-function isWhitespace(c: number): boolean {
-  return c === SPACE || c === LF || c === CR || c === TAB;
-}
-
-/** Characters that end a number, boolean, or null. */
-function isDelimiter(c: number): boolean {
-  return isWhitespace(c) || c === COMMA || c === COLON || c === RBRACKET || c === RBRACE
-    || c === LBRACKET || c === LBRACE || c === QUOTE;
-}
 
 function unexpected(c: number): SyntaxError {
   return new SyntaxError(c === EOF
@@ -123,211 +114,260 @@ function unexpected(c: number): SyntaxError {
     : `Unexpected token '${String.fromCharCode(c)}' in JSON`);
 }
 
+const encoder = new TextEncoder();
+// Keeps a leading U+FEFF, which would otherwise be dropped from string contents.
+const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+
+// INPUT //////////////////////////////////////////////////////////////////////
+
+// The stream is buffered as bytes in memory and tokenized in one pass. A token
+// is the address of a byte that starts something: a bracket, comma, or colon,
+// either quote of a string, or the first byte of a number, boolean, or null.
+// The kind of a token is the byte it points to. A number, boolean, or null
+// ends at the next token or the end of the stream.
+
+/** Tokenizer state: inside a string, after a backslash, inside a scalar. */
+const IN_STRING = 1, ESCAPED = 2, IN_SCALAR = 4;
+
 /**
- * The text of the stream with a cursor, hiding chunk boundaries. Values are
- * delimited by a scanner that only tracks nesting depth and strings.
+ * Tokenizes the bytes at [pos, end) starting in `state`, writing the tokens
+ * as 32-bit words at `out`. Returns the number of tokens times 8 plus the
+ * state at `end`.
  */
-class Input {
-  #chunks: AsyncIterator<string>;
-  #buf = '';
-  #pos = 0;
-  #ended = false;
+type Tokenize = (state: number, pos: number, end: number, out: number) => number;
 
-  // Scanner state.
-  #depth = 0;
-  #inString = false;
-  #escaped = false;
+/** Words in the token region at the start of memory, followed by bytes. */
+const TOKENS = 16384;
+const BYTES = TOKENS * 4;
+const PAGE = 65536;
+const NONE = Infinity;
 
-  constructor(chunks: AsyncIterator<string>) {
-    this.#chunks = chunks;
+/**
+ * The bytes of the stream and their tokens, hiding chunk boundaries. Fields
+ * holding addresses (`len`, `scanned`, `mark`) are updated when bytes move.
+ */
+type Input = {
+  chunks: AsyncIterator<Uint8Array | string>;
+  memory: WebAssembly.Memory;
+  /** Views of memory, renewed when it grows. */
+  bytes: Uint8Array;
+  tokens: Uint32Array;
+  tokenize: Tokenize;
+  /** End of the buffered bytes. */
+  len: number;
+  /** End of the tokenized bytes, and the tokenizer state there. */
+  scanned: number;
+  state: number;
+  /** Index of the next token, and the number of tokens in the region. */
+  cursor: number;
+  count: number;
+  /** The earliest byte the consumer still needs, or NONE. */
+  mark: number;
+  ended: boolean;
+  /** A high surrogate held back from the end of a text chunk. */
+  surrogate: string;
+};
+
+function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
+  const memory = new WebAssembly.Memory({ initial: 4 });
+  const input: Input = {
+    chunks, memory, bytes: new Uint8Array(), tokens: new Uint32Array(),
+    tokenize: tokenizer(memory),
+    len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE,
+    ended: false, surrogate: '',
+  };
+  renewViews(input);
+  return input;
+}
+
+function renewViews(input: Input): void {
+  input.bytes = new Uint8Array(input.memory.buffer);
+  input.tokens = new Uint32Array(input.memory.buffer, 0, TOKENS);
+}
+
+// Functions that may have to wait for input return a promise only when they
+// do, to avoid the cost of awaiting when the input is already buffered.
+
+/**
+ * Returns the kind of the next token, EOF, or MORE if the buffered input ran
+ * out (see more).
+ */
+function peek(input: Input): number {
+  if (input.cursor >= input.count && !scan(input)) {
+    if (!input.ended) return MORE;
+    if (input.state & IN_STRING) throw unexpected(EOF);
+    return EOF;
   }
+  return input.bytes[input.tokens[input.cursor]!]!;
+}
 
-  // Methods that may have to wait for input return a promise only when they
-  // do, to avoid the cost of awaiting when the input is already buffered.
-
-  /**
-   * Skips whitespace and returns the next character, EOF, or MORE if the
-   * buffered input ran out (see peekAsync).
-   */
-  peek(): number {
-    const buf = this.#buf;
-    let pos = this.#pos;
-    while (pos < buf.length) {
-      const c = buf.charCodeAt(pos);
-      if (!isWhitespace(c)) {
-        this.#pos = pos;
-        return c;
-      }
-      pos++;
-    }
-    this.#pos = pos;
-    return this.#ended ? EOF : MORE;
+/**
+ * Tokenizes buffered bytes until the token at the cursor exists. Returns false
+ * if the buffered bytes ran out first. The cursor may be past the tokens
+ * found so far, to skip tokens that haven't been found yet.
+ */
+function scan(input: Input): boolean {
+  while (input.cursor >= input.count) {
+    if (input.scanned === input.len) return false;
+    // Every token has been consumed, so the region can be reused.
+    input.cursor -= input.count;
+    input.count = 0;
+    const end = Math.min(input.len, input.scanned + TOKENS);
+    const result = input.tokenize(input.state, input.scanned, end, 0);
+    input.count = result >>> 3;
+    input.state = result & 7;
+    input.scanned = end;
   }
+  return true;
+}
 
-  /** Like peek, but waits for input instead of returning MORE. */
-  async peekAsync(): Promise<number> {
-    let c;
-    while ((c = this.peek()) === MORE) await this.#fill();
-    return c;
-  }
-
-  /** Consumes the character returned by peek. */
-  advance(): void {
-    this.#pos++;
-  }
-
-  /** Enters the string, array, or object that starts at the peeked character. */
-  enter(): void {
-    const c = this.#buf.charCodeAt(this.#pos);
-    this.#inString = c === QUOTE;
-    this.#escaped = false;
-    this.#depth = c === LBRACKET || c === LBRACE ? 1 : 0;
-    this.#pos++;
-  }
-
-  /**
-   * Consumes the value that starts at the peeked character, returning its
-   * text if `capture` is true.
-   */
-  value(capture: boolean): string | Promise<string> {
-    const c = this.#buf.charCodeAt(this.#pos);
-    const start = this.#pos;
-    if (c === QUOTE || c === LBRACKET || c === LBRACE) {
-      this.enter();
-    } else {
-      this.#inString = false;
-      this.#depth = 0;
-    }
-    return this.#scan(start, capture);
-  }
-
-  /** Skips the rest of the array or object entered last, between elements. */
-  exitContainer(): string | Promise<string> {
-    this.#inString = false;
-    this.#depth = 1;
-    return this.#scan(this.#pos, false);
-  }
-
-  /** Skips the rest of the string entered last. */
-  exitString(): string | Promise<string> {
-    return this.#scan(this.#pos, false);
-  }
-
-  /**
-   * Returns the next piece of raw contents of the string entered last.
-   * `inString` is false once the closing quote has been consumed. Returns
-   * undefined if the buffered input ran out (see more).
-   */
-  stringSegment(): string | undefined {
-    if (this.#pos >= this.#buf.length) return undefined;
-    const start = this.#pos;
-    const closed = this.#scanChunk();
-    return this.#buf.slice(start, closed ? this.#pos - 1 : this.#pos);
-  }
-
-  /** Waits for more input inside a string. */
-  async more(): Promise<void> {
-    if (!(await this.#fill())) throw unexpected(EOF);
-  }
-
-  get inString(): boolean {
-    return this.#inString;
-  }
-
-  async close(): Promise<void> {
-    await this.#chunks.return?.();
-  }
-
-  async #fill(): Promise<boolean> {
-    const { done, value } = await this.#chunks.next();
-    this.#buf = done ? '' : value;
-    this.#pos = 0;
-    this.#ended = !!done;
-    return !done;
-  }
-
-  #scan(start: number, capture: boolean): string | Promise<string> {
-    if (this.#scanChunk()) return capture ? this.#buf.slice(start, this.#pos) : '';
-    return this.#scanAsync(capture ? [this.#buf.slice(start)] : undefined);
-  }
-
-  async #scanAsync(parts: string[] | undefined): Promise<string> {
-    for (;;) {
-      if (!(await this.#fill())) {
-        if (this.#inString || this.#depth > 0) throw unexpected(EOF);
-        break;
-      }
-      if (this.#scanChunk()) {
-        parts?.push(this.#buf.slice(0, this.#pos));
-        break;
-      }
-      parts?.push(this.#buf);
-    }
-    return parts?.join('') ?? '';
-  }
-
-  /**
-   * Advances the scanner through the current chunk. Returns true when the
-   * value is complete, leaving the cursor right after it.
-   */
-  #scanChunk(): boolean {
-    const buf = this.#buf;
-    let pos = this.#pos;
-    let depth = this.#depth;
-    let inString = this.#inString;
-    let done = false;
-    while (pos < buf.length) {
-      if (inString) {
-        // Find the closing quote: the first one preceded by an even number of
-        // backslashes. Only backslashes in this chunk count; an odd run at
-        // the end of the previous chunk escapes the first character here.
-        let from = pos;
-        if (this.#escaped) {
-          from++;
-          this.#escaped = false;
-        }
-        let quote = buf.indexOf('"', from);
-        while (quote !== -1 && backslashesBefore(buf, quote, from) % 2 === 1) {
-          quote = buf.indexOf('"', quote + 1);
-        }
-        if (quote === -1) {
-          this.#escaped = from < buf.length && backslashesBefore(buf, buf.length, from) % 2 === 1;
-          pos = buf.length;
-          break;
-        }
-        pos = quote + 1;
-        inString = false;
-        if (depth === 0) {
-          done = true;
-          break;
-        }
-        continue;
-      }
-      const c = buf.charCodeAt(pos);
-      if (depth === 0) {
-        if (isDelimiter(c)) {
-          done = true;
-          break;
-        }
-      } else if (c === QUOTE) {
-        inString = true;
-      } else if (c === LBRACKET || c === LBRACE) {
-        depth++;
-      } else if (c === RBRACKET || c === RBRACE) {
-        if (--depth === 0) {
-          pos++;
-          done = true;
-          break;
-        }
-      }
-      pos++;
-    }
-    this.#pos = pos;
-    this.#depth = depth;
-    this.#inString = inString;
-    return done;
+/** Waits for the next chunk. */
+async function more(input: Input): Promise<void> {
+  const { done, value } = await input.chunks.next();
+  if (!done) {
+    append(input, value);
+  } else {
+    input.ended = true;
+    if (input.surrogate) append(input, '');
   }
 }
+
+function append(input: Input, chunk: Uint8Array | string): void {
+  if (typeof chunk === 'string') {
+    // A surrogate pair split across chunks can't be encoded separately.
+    chunk = input.surrogate + chunk;
+    input.surrogate = '';
+    const last = chunk.charCodeAt(chunk.length - 1);
+    if (last >= 0xd800 && last < 0xdc00 && !input.ended) {
+      input.surrogate = chunk.slice(-1);
+      chunk = chunk.slice(0, -1);
+    }
+    reserve(input, chunk.length * 3);
+    input.len += encoder.encodeInto(chunk, input.bytes.subarray(input.len)).written;
+  } else {
+    reserve(input, chunk.length);
+    input.bytes.set(chunk, input.len);
+    input.len += chunk.length;
+  }
+}
+
+/**
+ * Makes room for `n` more bytes, dropping the bytes that are no longer needed
+ * or growing the memory. Must be called with every token consumed.
+ */
+function reserve(input: Input, n: number): void {
+  if (input.len + n <= input.bytes.length) return;
+  const keep = Math.min(input.mark, input.scanned);
+  const shift = keep - BYTES;
+  input.bytes.copyWithin(BYTES, keep, input.len);
+  input.len -= shift;
+  input.scanned -= shift;
+  input.mark -= shift;
+  const missing = input.len + n - input.bytes.length;
+  if (missing > 0) {
+    input.memory.grow(Math.ceil(Math.max(missing, input.bytes.length) / PAGE));
+    renewViews(input);
+  }
+}
+
+/**
+ * Consumes the value that starts at the next token, returning the address
+ * right after it. Returns a promise if it has to wait for input.
+ */
+function consumeValue(input: Input): number | Promise<number> {
+  const c = input.bytes[input.tokens[input.cursor++]!]!;
+  if (c === LBRACKET || c === LBRACE) return exitContainer(input, 1);
+  if (c === QUOTE) return exitString(input);
+  return scalarEnd(input);
+}
+
+/** Consumes the closing quote of a string, returning the address after it. */
+function exitString(input: Input): number | Promise<number> {
+  // Inside a string the only token is the closing quote, and peek fails if
+  // the input ends first.
+  if (peek(input) === MORE) return more(input).then(() => exitString(input));
+  return input.tokens[input.cursor++]! + 1;
+}
+
+/** Returns the end of the scalar consumed last, which is the next token. */
+function scalarEnd(input: Input): number | Promise<number> {
+  const c = peek(input);
+  if (c === MORE) return more(input).then(() => scalarEnd(input));
+  return c === EOF ? input.len : input.tokens[input.cursor]!;
+}
+
+/**
+ * Consumes tokens until `depth` open brackets have been closed, returning the
+ * address after the last one.
+ */
+function exitContainer(input: Input, depth: number): number | Promise<number> {
+  for (;;) {
+    const { bytes, tokens, count } = input;
+    for (let i = input.cursor; i < count; i++) {
+      const c = bytes[tokens[i]!]!;
+      if (c === LBRACKET || c === LBRACE) {
+        depth++;
+      } else if ((c === RBRACKET || c === RBRACE) && --depth === 0) {
+        input.cursor = i + 1;
+        return tokens[i]! + 1;
+      }
+    }
+    input.cursor = Math.max(input.cursor, count);
+    const c = peek(input);
+    if (c === EOF) throw unexpected(EOF);
+    if (c === MORE) return more(input).then(() => exitContainer(input, depth));
+  }
+}
+
+/** Consumes the value that starts at the next token, returning its text. */
+function valueText(input: Input): string | Promise<string> {
+  input.mark = input.tokens[input.cursor]!;
+  const end = consumeValue(input);
+  return typeof end === 'number' ? takeText(input, end) : end.then(end => takeText(input, end));
+}
+
+function takeText(input: Input, end: number): string {
+  const text = decoder.decode(input.bytes.subarray(input.mark, end));
+  input.mark = NONE;
+  return text;
+}
+
+/** A tokenizer written in JavaScript, operating on `memory`. */
+function tokenizer(memory: WebAssembly.Memory): Tokenize {
+  return (state, pos, end, out) => {
+    const bytes = new Uint8Array(memory.buffer);
+    const tokens = new Uint32Array(memory.buffer);
+    let n = out >> 2;
+    const first = n;
+    let inString = state & IN_STRING, escaped = state & ESCAPED, inScalar = state & IN_SCALAR;
+    for (; pos < end; pos++) {
+      const c = bytes[pos]!;
+      if (inString) {
+        if (escaped) {
+          escaped = 0;
+        } else if (c === BACKSLASH) {
+          escaped = ESCAPED;
+        } else if (c === QUOTE) {
+          inString = 0;
+          tokens[n++] = pos;
+        }
+      } else if (c === SPACE || c === LF || c === CR || c === TAB) {
+        inScalar = 0;
+      } else if (c === QUOTE || c === COMMA || c === COLON
+        || c === LBRACKET || c === RBRACKET || c === LBRACE || c === RBRACE) {
+        inString = c === QUOTE ? IN_STRING : 0;
+        inScalar = 0;
+        tokens[n++] = pos;
+      } else if (!inScalar) {
+        inScalar = IN_SCALAR;
+        tokens[n++] = pos;
+      }
+    }
+    return (n - first) * 8 + (inString | escaped | inScalar);
+  };
+}
+
+// VALUES /////////////////////////////////////////////////////////////////////
 
 const PENDING = 0, ACTIVE = 1, DONE = 2;
 
@@ -336,7 +376,7 @@ class Value implements JsonStValue {
   /** The key of an object member, which precedes this value in the stream. */
   #key: Value | undefined;
   #state = PENDING;
-  /** The first character of the value, once known. */
+  /** The kind of the first token of the value, once known. */
   #first = EOF;
   /** Whether a string, array, or object has been entered. */
   #entered = false;
@@ -353,7 +393,7 @@ class Value implements JsonStValue {
   async parse(): Promise<unknown> {
     this.#claim();
     const started = this.#start();
-    let text = started ? started.then(() => this.#input.value(true)) : this.#input.value(true);
+    let text = started ? started.then(() => valueText(this.#input)) : valueText(this.#input);
     if (typeof text !== 'string') {
       this.#capture = text;
       text = await text;
@@ -365,6 +405,10 @@ class Value implements JsonStValue {
   stringChunks(): AsyncIterable<string> {
     const input = this.#input;
     let entered = false;
+    let closed = false;
+    /** Decodes UTF-8 across segments, once the string spans several. */
+    let partial: TextDecoder | undefined;
+    /** An incomplete escape sequence at the end of the last segment. */
     let held = '';
     const step = (): Step<string> => {
       if (!entered) {
@@ -372,21 +416,33 @@ class Value implements JsonStValue {
         const started = this.#enter(QUOTE);
         if (started) return started.then(step);
       }
+      if (closed) return undefined;
       this.#checkActive();
-      while (input.inString) {
-        const segment = input.stringSegment();
-        if (segment === undefined) return input.more().then(step);
-        let raw = held + segment;
+      for (;;) {
+        // The contents start at the mark. The next token is the closing
+        // quote, if it has arrived.
+        const c = peek(input);
+        if (c === MORE && input.mark === input.len) return more(input).then(step);
+        closed = c !== MORE;
+        const end = closed ? input.tokens[input.cursor]! : input.len;
+        const bytes = input.bytes.subarray(input.mark, end);
+        let raw = held + (closed && partial === undefined
+          ? decoder.decode(bytes)
+          : (partial ??= new TextDecoder('utf-8', { ignoreBOM: true })).decode(bytes, { stream: !closed }));
         held = '';
-        if (input.inString) {
-          const end = completeEscapesEnd(raw);
-          held = raw.slice(end);
-          raw = raw.slice(0, end);
+        if (closed) {
+          input.cursor++;
+          input.mark = NONE;
+          this.#state = DONE;
+        } else {
+          input.mark = end;
+          const complete = completeEscapesEnd(raw);
+          held = raw.slice(complete);
+          raw = raw.slice(0, complete);
         }
         if (raw.length > 0) return decodeString(raw);
+        if (closed) return undefined;
       }
-      this.#state = DONE;
-      return undefined;
     };
     return new Items(step);
   }
@@ -404,16 +460,16 @@ class Value implements JsonStValue {
       this.#checkActive();
       const finished = child?.finish();
       if (finished) return finished.then(step);
-      const c = input.peek();
-      if (c === MORE) return input.peekAsync().then(step);
+      const c = peek(input);
+      if (c === MORE) return more(input).then(step);
       if (c === RBRACKET) {
-        input.advance();
+        input.cursor++;
         this.#state = DONE;
         return undefined;
       }
       if (child !== undefined) {
         if (c !== COMMA) throw unexpected(c);
-        input.advance();
+        input.cursor++;
       }
       return child = this.#child = new Value(input);
     };
@@ -435,20 +491,20 @@ class Value implements JsonStValue {
       if (value !== undefined) {
         const finished = value.finish();
         if (finished) return finished.then(step);
-        const c = input.peek();
-        if (c === MORE) return input.peekAsync().then(step);
+        const c = peek(input);
+        if (c === MORE) return more(input).then(step);
         if (c === COMMA) {
-          input.advance();
+          input.cursor++;
           value = undefined;
           afterComma = true;
         } else if (c !== RBRACE) {
           throw unexpected(c);
         }
       }
-      const c = input.peek();
-      if (c === MORE) return input.peekAsync().then(step);
+      const c = peek(input);
+      if (c === MORE) return more(input).then(step);
       if (c === RBRACE && !afterComma) {
-        input.advance();
+        input.cursor++;
         this.#state = DONE;
         return undefined;
       }
@@ -470,20 +526,21 @@ class Value implements JsonStValue {
     if (state === DONE) return;
     this.#state = DONE;
     const input = this.#input;
-    let result: string | Promise<unknown> | undefined;
+    let result: number | Promise<unknown> | undefined;
     if (this.#capture !== undefined) {
       result = this.parsed();
     } else if (!this.#entered) {
       // Nothing has been consumed yet (an iterator may be about to start).
       const started = this.#start();
-      result = started ? started.then(() => input.value(false)) : input.value(false);
+      result = started ? started.then(() => consumeValue(input)) : consumeValue(input);
     } else if (this.#first === QUOTE) {
-      result = input.exitString();
+      input.mark = NONE;
+      result = exitString(input);
     } else {
       const finished = this.#child?.finish();
-      result = finished ? finished.then(() => input.exitContainer()) : input.exitContainer();
+      result = finished ? finished.then(() => exitContainer(input, 1)) : exitContainer(input, 1);
     }
-    return typeof result === 'string' ? undefined : result;
+    return typeof result === 'number' ? undefined : result;
   }
 
   /** Waits until a parse in progress, if any, has consumed its input. */
@@ -501,7 +558,7 @@ class Value implements JsonStValue {
   }
 
   /**
-   * Moves the input to the first character of the value. Returns a promise if
+   * Moves the input to the first token of the value. Returns a promise if
    * it has to wait for input.
    */
   #start(): Promise<void> | undefined {
@@ -511,14 +568,14 @@ class Value implements JsonStValue {
     if (key !== undefined) {
       const finished = key.finish();
       if (finished) return finished.then(() => this.#start());
-      const c = input.peek();
-      if (c === MORE) return input.peekAsync().then(() => this.#start());
+      const c = peek(input);
+      if (c === MORE) return more(input).then(() => this.#start());
       if (c !== COLON) throw unexpected(c);
-      input.advance();
+      input.cursor++;
       this.#key = undefined;
     }
-    const c = input.peek();
-    if (c === MORE) return input.peekAsync().then(() => this.#start());
+    const c = peek(input);
+    if (c === MORE) return more(input).then(() => this.#start());
     if (c === EOF || c === COMMA || c === COLON || c === RBRACKET || c === RBRACE) {
       throw unexpected(c);
     }
@@ -541,16 +598,12 @@ class Value implements JsonStValue {
       this.#state = PENDING;
       throw new TypeError(`Expected JSON ${TYPE_NAMES[open]}, found ${typeName(this.#first)}`);
     }
-    this.#input.enter();
+    const input = this.#input;
+    // For strings, the mark is where the contents start.
+    if (open === QUOTE) input.mark = input.tokens[input.cursor]! + 1;
+    input.cursor++;
     this.#entered = true;
   }
-}
-
-/** Counts the backslashes that precede `end`, back to `start`. */
-function backslashesBefore(buf: string, end: number, start: number): number {
-  let i = end;
-  while (i > start && buf.charCodeAt(i - 1) === BACKSLASH) i--;
-  return end - i;
 }
 
 const TYPE_NAMES: Record<number, string> = { [QUOTE]: 'string', [LBRACKET]: 'array', [LBRACE]: 'object' };
