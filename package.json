@@ -1,0 +1,32 @@
+{
+  "name": "json-street",
+  "version": "2.0.0-0",
+  "description": "Simple and efficient streaming JSON parser.",
+  "author": "Francisco Giordano <fg@frang.io>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frangio/json-street.git"
+  },
+  "type": "module",
+  "exports": {
+    "types": "./dist/index.d.ts",
+    "default": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src/index.ts"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "check": "tsc",
+    "test": "node --test 'src/**/*.test.ts'",
+    "bench": "node bench/bench.ts",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "fast-check": "^4.10.2",
+    "typescript": "^7.0.2"
+  }
+}

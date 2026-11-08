@@ -8,14 +8,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: denoland/setup-deno@v2
-        with:
-          cache: true
-      - run: deno check
-      - run: deno test
-
-      - run: deno install --node-modules-dir=manual
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - run: node --experimental-transform-types --test-reporter=spec src/test.ts
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
