@@ -23,13 +23,17 @@ export interface JsonStValue {
  */
 export async function* parseValues(stream: AsyncIterable<string>): AsyncIterable<JsonStValue> {
   const input = new Input(stream[Symbol.asyncIterator]());
+  let value: Value | undefined;
   try {
     while ((await input.peek()) !== EOF) {
-      const value = new Value(input);
+      value = new Value(input);
       yield value;
       await value.finish();
     }
   } finally {
+    // The consumer may stop iterating while a parse is in progress, as in
+    // `for await (const v of parseValues(s)) return v.parse();`
+    await value?.parsed();
     await input.close();
   }
 }
@@ -307,7 +311,7 @@ class Value implements JsonStValue {
       await this.#input.value(false);
     } else if (this.#state === ACTIVE) {
       if (this.#capture !== undefined) {
-        await this.#capture.catch(() => {});
+        await this.parsed();
       } else if (!this.#entered) {
         // An iterator is about to start; nothing has been consumed yet.
         await this.#start();
@@ -320,6 +324,11 @@ class Value implements JsonStValue {
       }
     }
     this.#state = DONE;
+  }
+
+  /** Waits until a parse in progress, if any, has consumed its input. */
+  async parsed(): Promise<void> {
+    await this.#capture?.catch(() => {});
   }
 
   #claim(): void {

@@ -253,6 +253,13 @@ test('parse may be awaited after advancing', async () => {
   assert.deepEqual(await Promise.all(promises), [{ a: 1 }, 2, 'x']);
 });
 
+test('parse may be returned from the loop', async () => {
+  async function first() {
+    for await (const value of parseValues(stream('[1,', '2]'))) return value.parse();
+  }
+  assert.deepEqual(await first(), [1, 2]);
+});
+
 test('object values may be read before keys', async () => {
   for await (const value of parseValues(stream('{"a":1,"b":[2]}'))) {
     const result = [];
