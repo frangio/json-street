@@ -359,6 +359,8 @@ function parseMarked(input: Input, end: number): unknown {
  * in order, so byte addresses are mapped to text indices incrementally.
  */
 function valueText(input: Input, start: number, end: number): string {
+  // Short values are cheaper to decode in JavaScript than to map.
+  if (end - start <= 16) return decodeText(input.bytes, start, end);
   if (start < input.textStart || end > input.textEnd) {
     // A character split at the end of the buffered bytes comes after `end`,
     // so how it is decoded doesn't matter.
