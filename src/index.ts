@@ -195,11 +195,12 @@ type Input = {
   /** The earliest byte the consumer still needs, or NONE. */
   mark: number;
   /**
-   * The bytes of the value at `mark` before it, dropped from the buffer, and
-   * their number. They are decoded with the rest of the value, because
+   * The bytes of the value at `mark` before it, dropped from the buffer, are
+   * the first `spilled` bytes of `spill`, which grows as needed and is reused
+   * for later values. They are decoded with the rest of the value, because
    * JSON.parse would copy text joined from pieces.
    */
-  spill: Uint8Array[];
+  spill: Uint8Array;
   spilled: number;
   ended: boolean;
   /** A high surrogate held back from the end of a text chunk. */
@@ -224,7 +225,7 @@ function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
     tokens: new Uint16Array(memory.buffer, 0, TOKENS),
     links: new Uint16Array(memory.buffer, LINKS, TOKENS),
     ...tokenizer(memory),
-    base: 0, len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE, spill: [], spilled: 0,
+    base: 0, len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE, spill: new Uint8Array(), spilled: 0,
     ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
   };
 }
@@ -306,8 +307,7 @@ function drop(input: Input): void {
   const { bytes, len } = input;
   let keep = Math.min(input.mark, len);
   if (len - keep > BUFFER / 2) {
-    input.spill.push(bytes.slice(keep, len));
-    input.spilled += len - keep;
+    spill(input, keep, len);
     keep = input.mark = len;
   }
   const shift = keep - BYTES;
@@ -316,6 +316,18 @@ function drop(input: Input): void {
   input.scanned -= shift;
   input.mark -= shift;
   input.textEnd = 0;
+}
+
+/** Appends the bytes at [start, end) to the spilled bytes. */
+function spill(input: Input, start: number, end: number): void {
+  const n = input.spilled + end - start;
+  if (n > input.spill.length) {
+    const grown = new Uint8Array(Math.max(n, input.spill.length * 2));
+    grown.set(input.spill.subarray(0, input.spilled));
+    input.spill = grown;
+  }
+  input.spill.set(input.bytes.subarray(start, end), input.spilled);
+  input.spilled = n;
 }
 
 /** Copies as much of the pending chunk as fits in the buffer. */
@@ -408,17 +420,11 @@ function parseValue(input: Input): unknown {
 }
 
 function parseMarked(input: Input, end: number): unknown {
-  const { bytes, mark, spill } = input;
+  const { bytes, mark } = input;
   input.mark = NONE;
-  if (spill.length > 0) {
-    const all = new Uint8Array(input.spilled + (end & ADDRESS) - mark);
-    let at = 0;
-    for (const piece of spill) {
-      all.set(piece, at);
-      at += piece.length;
-    }
-    all.set(bytes.subarray(mark, end & ADDRESS), at);
-    input.spill = [];
+  if (input.spilled > 0) {
+    spill(input, mark, end & ADDRESS);
+    const all = input.spill.subarray(0, input.spilled);
     input.spilled = 0;
     return all[0] === QUOTE ? decodeString(all, 1, all.length - 1, end >= SPECIAL) : JSON.parse(decoder.decode(all));
   }
