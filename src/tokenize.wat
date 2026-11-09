@@ -11,27 +11,49 @@
 ;;
 ;; The token of the closing quote of a string has bit 31 set when the string
 ;; contains a backslash or a control character, so needs more than decoding.
+;;
+;; It also matches brackets: when a bracket closes in the same call that it
+;; opened in, the index of its token is written at $LINKS + 4 × the index of
+;; the opening bracket's token. Every other opening bracket gets 0 there.
+;; Open brackets are kept on a stack at $STACK, of at most $CAP entries, which
+;; persists across calls. Entries from earlier calls are not linked, since
+;; their tokens are gone.
 (module
   (import "env" "memory" (memory 1))
 
-  ;; Returns bitmasks of the 64 bytes at $p: quotes, backslashes, brackets
-  ;; and commas and colons, those or whitespace, and control characters.
-  (func $classify (param $p i32) (result i64 i64 i64 i64 i64)
+  (global $LINKS i32 (i32.const 65536))
+  (global $STACK i32 (i32.const 131072))
+  (global $CAP i32 (i32.const 16384))
+  ;; The number of open brackets, and the depth below which entries of the
+  ;; stack come from earlier calls.
+  (global $depth (mut i32) (i32.const 0))
+  (global $floor (mut i32) (i32.const 0))
+
+  ;; Returns bitmasks of the 64 bytes at $p: quotes, backslashes, opening
+  ;; brackets, closing brackets, brackets and commas and colons, those or
+  ;; whitespace, and control characters.
+  (func $classify (param $p i32) (result i64 i64 i64 i64 i64 i64 i64)
     (local $i i32) (local $shift i64) (local $v v128) (local $lower v128) (local $s v128)
+    (local $opening v128) (local $closing v128)
     (local $quote i64) (local $backslash i64) (local $struct i64) (local $space i64) (local $control i64)
+    (local $open i64) (local $close i64)
     (loop $parts
       (local.set $v (v128.load (i32.add (local.get $p) (local.get $i))))
       ;; Setting bit 5 maps [ to { and ] to }, and no other byte to either.
       (local.set $lower (v128.or (local.get $v) (i8x16.splat (i32.const 0x20))))
+      (local.set $opening (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7b))))
+      (local.set $closing (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7d))))
       (local.set $s
         (v128.or
           (v128.or
             (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x2c)))
             (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x3a))))
-          (v128.or
-            (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7b)))
-            (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7d))))))
+          (v128.or (local.get $opening) (local.get $closing))))
       (local.set $shift (i64.extend_i32_u (local.get $i)))
+      (local.set $open (i64.or (local.get $open)
+        (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $opening))) (local.get $shift))))
+      (local.set $close (i64.or (local.get $close)
+        (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $closing))) (local.get $shift))))
       (local.set $quote (i64.or (local.get $quote)
         (i64.shl (i64.extend_i32_u (i8x16.bitmask
           (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x22))))) (local.get $shift))))
@@ -57,7 +79,8 @@
       (br_if $parts (i32.lt_u
         (local.tee $i (i32.add (local.get $i) (i32.const 16)))
         (i32.const 64))))
-    (local.get $quote) (local.get $backslash) (local.get $struct) (local.get $space) (local.get $control))
+    (local.get $quote) (local.get $backslash) (local.get $open) (local.get $close)
+    (local.get $struct) (local.get $space) (local.get $control))
 
   (func (export "tokenize") (param $state i32) (param $pos i32) (param $end i32) (param $out i32) (result i32)
     (local $first i32) (local $n i32) (local $last i64) (local $valid i64)
@@ -68,7 +91,11 @@
     ;; Control characters or backslashes in strings, whether the open string
     ;; has had one, the position after the last opening quote, and a token.
     (local $specials i64) (local $special i64) (local $runStart i64) (local $bit i64) (local $flag i32)
+    ;; Opening and closing brackets outside strings, the index of the first
+    ;; token of the block, and the tokens of the block.
+    (local $open i64) (local $close i64) (local $index i32) (local $blockTokens i64) (local $at i32)
     (local.set $first (local.get $out))
+    (global.set $floor (global.get $depth))
     (local.set $inString (i64.extend_i32_u (i32.and (local.get $state) (i32.const 1))))
     (local.set $escaped (i64.extend_i32_u (i32.and (i32.shr_u (local.get $state) (i32.const 1)) (i32.const 1))))
     (local.set $inScalar (i64.extend_i32_u (i32.and (i32.shr_u (local.get $state) (i32.const 2)) (i32.const 1))))
@@ -93,6 +120,8 @@
         (local.set $specials)
         (local.set $delim)
         (local.set $struct)
+        (local.set $close)
+        (local.set $open)
         (local.set $backslash)
         (local.set $quote)
         (local.set $backslash (i64.and (local.get $backslash) (local.get $valid)))
@@ -153,6 +182,8 @@
                 (i64.const -1)))))
         (local.set $inScalar (i64.and (i64.shr_u (local.get $scalar) (local.get $last)) (i64.const 1)))
 
+        (local.set $blockTokens (local.get $tokens))
+        (local.set $index (i32.shr_u (i32.sub (local.get $out) (local.get $first)) (i32.const 2)))
         ;; A string open from an earlier block runs from the block's start.
         (local.set $runStart (i64.const 0))
         (block $written
@@ -185,6 +216,45 @@
             (local.set $tokens (i64.and (local.get $tokens)
               (i64.sub (local.get $tokens) (i64.const 1))))
             (br $write)))
+        ;; Brackets are matched in a separate loop, which only runs for them.
+        (local.set $open (i64.and (local.get $open) (i64.and (local.get $valid)
+          (i64.xor (local.get $inside) (i64.const -1)))))
+        (local.set $close (i64.and (local.get $close) (i64.and (local.get $valid)
+          (i64.xor (local.get $inside) (i64.const -1)))))
+        (local.set $open (i64.or (local.get $open) (local.get $close)))
+        (block $matched
+          (loop $match
+            (br_if $matched (i64.eqz (local.get $open)))
+            (local.set $bit (i64.ctz (local.get $open)))
+            ;; The index of the bracket's token among the tokens of the call.
+            (local.set $at (i32.add (local.get $index) (i32.wrap_i64 (i64.popcnt (i64.and (local.get $blockTokens)
+              (i64.sub (i64.shl (i64.const 1) (local.get $bit)) (i64.const 1)))))))
+            (if (i32.wrap_i64 (i64.and (i64.shr_u (local.get $close) (local.get $bit)) (i64.const 1)))
+              (then
+                ;; Unbalanced closing brackets are left for the parser to reject.
+                (if (global.get $depth)
+                  (then
+                    (global.set $depth (i32.sub (global.get $depth) (i32.const 1)))
+                    (if (i32.and
+                          (i32.ge_u (global.get $depth) (global.get $floor))
+                          (i32.lt_u (global.get $depth) (global.get $CAP)))
+                      (then (i32.store
+                        (i32.add (global.get $LINKS) (i32.shl
+                          (i32.load (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 2))))
+                          (i32.const 2)))
+                        (local.get $at))))
+                    (if (i32.lt_u (global.get $depth) (global.get $floor))
+                      (then (global.set $floor (global.get $depth)))))))
+              (else
+                (i32.store (i32.add (global.get $LINKS) (i32.shl (local.get $at) (i32.const 2))) (i32.const 0))
+                (if (i32.lt_u (global.get $depth) (global.get $CAP))
+                  (then (i32.store
+                    (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 2)))
+                    (local.get $at))))
+                (global.set $depth (i32.add (global.get $depth) (i32.const 1)))))
+            (local.set $open (i64.and (local.get $open) (i64.sub (local.get $open) (i64.const 1))))
+            (br $match)))
+
         ;; A string still open carries whether it had a special character.
         (if (i32.and (i32.wrap_i64 (local.get $inString)) (i64.lt_u (local.get $runStart) (i64.const 64)))
           (then (local.set $special (i64.or (local.get $special)

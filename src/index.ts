@@ -138,14 +138,19 @@ const IN_STRING = 1;
 
 /**
  * Tokenizes the bytes at [pos, end) starting in `state`, writing the tokens
- * as 32-bit words at `out`. Returns the number of tokens times 16 plus the
- * state at `end`.
+ * as 32-bit words at `out`, which must be 0, and linking brackets (see
+ * Input.links). Returns the number of tokens times 16 plus the state at `end`.
  */
 type Tokenize = (state: number, pos: number, end: number, out: number) => number;
 
-/** Words in the token region at the start of memory, followed by bytes. */
+/**
+ * Words in the token region at the start of memory. It is followed by the
+ * links of brackets, the tokenizer's stack of open brackets (both of the same
+ * size, see tokenize.wat), and the bytes.
+ */
 const TOKENS = 16384;
-const BYTES = TOKENS * 4;
+const LINKS = TOKENS * 4;
+const BYTES = TOKENS * 12;
 /** Bytes past the buffered ones that the tokenizer may read. */
 const SLACK = 64;
 const PAGE = 65536;
@@ -161,6 +166,11 @@ type Input = {
   /** Views of memory, renewed when it grows. */
   bytes: Uint8Array;
   tokens: Uint32Array;
+  /**
+   * For the token of an opening bracket, the index of the token of its
+   * closing bracket if it was found in the same call to tokenize, else 0.
+   */
+  links: Uint32Array;
   tokenize: Tokenize;
   /** End of the buffered bytes. */
   len: number;
@@ -190,7 +200,7 @@ type Input = {
 function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
   const memory = new WebAssembly.Memory({ initial: 4 });
   const input: Input = {
-    chunks, memory, bytes: new Uint8Array(), tokens: new Uint32Array(),
+    chunks, memory, bytes: new Uint8Array(), tokens: new Uint32Array(), links: new Uint32Array(),
     ...tokenizer(memory),
     len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE,
     ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
@@ -202,6 +212,7 @@ function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
 function renewViews(input: Input): void {
   input.bytes = new Uint8Array(input.memory.buffer);
   input.tokens = new Uint32Array(input.memory.buffer, 0, TOKENS);
+  input.links = new Uint32Array(input.memory.buffer, LINKS, TOKENS);
 }
 
 // Functions that may have to wait for input return a promise only when they
@@ -298,7 +309,12 @@ function reserve(input: Input, n: number): void {
  */
 function consumeValue(input: Input): number | Promise<number> {
   const c = input.bytes[input.tokens[input.cursor++]!]!;
-  if (c === LBRACKET || c === LBRACE) return exitContainer(input, 1);
+  if (c === LBRACKET || c === LBRACE) {
+    const link = input.links[input.cursor - 1]!;
+    if (link === 0) return exitContainer(input, 1);
+    input.cursor = link + 1;
+    return input.tokens[link]! + 1;
+  }
   if (c === QUOTE) return exitString(input);
   return scalarEnd(input);
 }
@@ -323,15 +339,17 @@ function scalarEnd(input: Input): number | Promise<number> {
 
 /**
  * Consumes tokens until `depth` open brackets have been closed, returning the
- * address after the last one.
+ * address after the last one. Linked brackets are skipped over.
  */
 function exitContainer(input: Input, depth: number): number | Promise<number> {
   for (;;) {
-    const { bytes, tokens, count } = input;
+    const { bytes, tokens, links, count } = input;
     for (let i = input.cursor; i < count; i++) {
       const c = bytes[tokens[i]! & ADDRESS]!;
       if (c === LBRACKET || c === LBRACE) {
-        depth++;
+        const link = links[i]!;
+        if (link === 0) depth++;
+        else i = link;
       } else if ((c === RBRACKET || c === RBRACE) && --depth === 0) {
         input.cursor = i + 1;
         return tokens[i]! + 1;
@@ -422,7 +440,7 @@ function decodeText(bytes: Uint8Array, start: number, end: number): string {
 }
 
 /** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
-const TOKENIZER = 'AGFzbQEAAAABGANgAX8Ffn5+fn5gBH9/f38Bf2ACf38BfwIPAQNlbnYGbWVtb3J5AgABAwQDAAECBxoCCHRva2VuaXplAAELdXRmMTZMZW5ndGgAAgq6BwPkAQQBfwF+A3sFfgNAIAAgAWr9AAQAIQMgA0Eg/Q/9UCEEIANBLP0P/SMgA0E6/Q/9I/1QIARB+wD9D/0jIARB/QD9D/0j/VD9UCEFIAGtIQIgBiADQSL9D/0j/WStIAKGhCEGIAcgA0HcAP0P/SP9ZK0gAoaEIQcgCiADQSD9D/0m/WStIAKGhCEKIAggBf1krSAChoQhCCAJIAUgA0Eg/Q/9IyADQQn9D/0j/VAgA0EK/Q/9IyADQQ39D/0j/VD9UP1Q/WStIAKGhCEJIAFBEGoiAUHAAEkNAAsgBiAHIAggCSAKC98EAwJ/FH4BfyADIQQgAEEBca0hDCAAQQF2QQFxrSENIABBAnZBAXGtIQ4gAEEDdq0hFwJAA0AgASACTw0BIAIgAWshBSAFQcAATwRAQcAAIQVCfyEHBUIBIAWthkIBfSEHCyAFQQFrrSEGIAEQACEWIQshCiEJIQggCSAHgyEJIBYgCYQgB4MhFiAJIAlCAYZCf4WDIQ9C1arVqtWq1arVACANhSEQIAkgDyAQQn+Fg3whESAJQn+FIAkgDyAQg3xCqtWq1arVqtWqf4MgESANhELVqtWq1arVqtUAg4SDIRIgESAJVK0gEiAFrYhCAYMgBUHAAEYbIQ0gCCAHgyASQn+FgyEIIAghEyATIBNCAYaFIRMgEyATQgKGhSETIBMgE0IEhoUhEyATIBNCCIaFIRMgEyATQhCGhSETIBMgE0IghoUhEyATQgAgDH2FIRMgEyAGiEIBgyEMIAcgCCALhCAThEJ/hYMhFCAIIAogB4MgE0J/hYOEIBQgFEIBhiAOhEJ/hYOEIRUgFCAGiEIBgyEOQgAhGAJAA0AgFVANASAVeiEZQQAhGiAIIBmIQgGDpwRAIBMgGYhCAYOnBEBCACEXIBlCAXwhGAUgF6dCACAWQgEgGYZCAX1CASAYhkIBfUJ/hYODUnIhGkIAIRcLCyADIAEgGadqIBpBH3RyNgIAIANBBGohAyAVIBVCAX2DIRUMAAsLIAynIBhCwABUcQRAIBdCACAWIBiIUq2EIRcLIAFBwABqIQEMAAsLIAMgBGtBAnQgDCANQgGGhCAOQgKGIBcgDINCA4aEhKdyC3EDAX8BewJ/AkADQCAAIAFPDQEgAP0ABAAhAyABIABrIQVB//8DQQEgBXRBAWsgBUEQTxshBCACIARBfyADQcAB/Q/9TkGAAf0P/SP9ZHNxaSAEIANB8AH9D/0s/WRxaWpqIQIgAEEQaiEADAALCyACCw==';
+const TOKENIZER = 'AGFzbQEAAAABGgNgAX8Hfn5+fn5+fmAEf39/fwF/YAJ/fwF/Ag8BA2VudgZtZW1vcnkCAAEDBAMAAQIGIAV/AEGAgAQLfwBBgIAIC38AQYCAAQt/AUEAC38BQQALBxoCCHRva2VuaXplAAELdXRmMTZMZW5ndGgAAgq/CQOKAgQBfwF+BXsHfgNAIAAgAWr9AAQAIQMgA0Eg/Q/9UCEEIARB+wD9D/0jIQYgBEH9AP0P/SMhByADQSz9D/0jIANBOv0P/SP9UCAGIAf9UP1QIQUgAa0hAiANIAb9ZK0gAoaEIQ0gDiAH/WStIAKGhCEOIAggA0Ei/Q/9I/1krSAChoQhCCAJIANB3AD9D/0j/WStIAKGhCEJIAwgA0Eg/Q/9Jv1krSAChoQhDCAKIAX9ZK0gAoaEIQogCyAFIANBIP0P/SMgA0EJ/Q/9I/1QIANBCv0P/SMgA0EN/Q/9I/1Q/VD9UP1krSAChoQhCyABQRBqIgFBwABJDQALIAggCSANIA4gCiALIAwLvgYHAn8UfgF/An4BfwF+AX8gAyEEIwMkBCAAQQFxrSEMIABBAXZBAXGtIQ0gAEECdkEBca0hDiAAQQN2rSEXAkADQCABIAJPDQEgAiABayEFIAVBwABPBEBBwAAhBUJ/IQcFQgEgBa2GQgF9IQcLIAVBAWutIQYgARAAIRYhCyEKIRwhGyEJIQggCSAHgyEJIBYgCYQgB4MhFiAJIAlCAYZCf4WDIQ9C1arVqtWq1arVACANhSEQIAkgDyAQQn+Fg3whESAJQn+FIAkgDyAQg3xCqtWq1arVqtWqf4MgESANhELVqtWq1arVqtUAg4SDIRIgESAJVK0gEiAFrYhCAYMgBUHAAEYbIQ0gCCAHgyASQn+FgyEIIAghEyATIBNCAYaFIRMgEyATQgKGhSETIBMgE0IEhoUhEyATIBNCCIaFIRMgEyATQhCGhSETIBMgE0IghoUhEyATQgAgDH2FIRMgEyAGiEIBgyEMIAcgCCALhCAThEJ/hYMhFCAIIAogB4MgE0J/hYOEIBQgFEIBhiAOhEJ/hYOEIRUgFCAGiEIBgyEOIBUhHiADIARrQQJ2IR1CACEYAkADQCAVUA0BIBV6IRlBACEaIAggGYhCAYOnBEAgEyAZiEIBg6cEQEIAIRcgGUIBfCEYBSAXp0IAIBZCASAZhkIBfUIBIBiGQgF9Qn+Fg4NSciEaQgAhFwsLIAMgASAZp2ogGkEfdHI2AgAgA0EEaiEDIBUgFUIBfYMhFQwACwsgGyAHIBNCf4WDgyEbIBwgByATQn+Fg4MhHCAbIByEIRsCQANAIBtQDQEgG3ohGSAdIB5CASAZhkIBfYN7p2ohHyAcIBmIQgGDpwRAIwMEQCMDQQFrJAMjAyMETyMDIwJJcQRAIwAjASMDQQJ0aigCAEECdGogHzYCAAsjAyMESQRAIwMkBAsLBSMAIB9BAnRqQQA2AgAjAyMCSQRAIwEjA0ECdGogHzYCAAsjA0EBaiQDCyAbIBtCAX2DIRsMAAsLIAynIBhCwABUcQRAIBdCACAWIBiIUq2EIRcLIAFBwABqIQEMAAsLIAMgBGtBAnQgDCANQgGGhCAOQgKGIBcgDINCA4aEhKdyC3EDAX8BewJ/AkADQCAAIAFPDQEgAP0ABAAhAyABIABrIQVB//8DQQEgBXRBAWsgBUEQTxshBCACIARBfyADQcAB/Q/9TkGAAf0P/SP9ZHNxaSAEIANB8AH9D/0s/WRxaWpqIQIgAEEQaiEADAALCyACCw==';
 
 const tokenizerModule = new WebAssembly.Module(Uint8Array.from(atob(TOKENIZER), c => c.charCodeAt(0)));
 
