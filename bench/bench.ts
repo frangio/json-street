@@ -1,8 +1,9 @@
 // Usage: node bench/bench.ts [name-filter] [--base <git-ref>]
 //
-// Reports the throughput of each workload in MB/s of JSON text, using the
-// CPU time of the main thread, which is less noisy than wall time. Each
-// measurement runs in a separate process to isolate workloads from each other.
+// Reports the throughput of each workload in MB/s of JSON text: the average
+// over repeated runs for a fixed wall time, after a warmup. Wall time includes
+// GC on helper threads; pin the process to an idle core (taskset) so it is not
+// shared. Each measurement runs in a separate process to isolate workloads.
 //
 // With --base, compares the working tree against the library at a git ref,
 // alternating between the two so that drift in the machine affects both.
@@ -183,7 +184,9 @@ async function* decode(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<string
   for await (const chunk of chunks) yield decoder.decode(chunk, { stream: true });
 }
 
-const RUNS = 7;
+// Long enough to average over many GC cycles, which a short run may dodge.
+const WARMUP_MS = 500;
+const MEASURE_MS = 2000;
 const ROUNDS = 6;
 
 /** Runs a workload in a child process and returns its throughput in MB/s. */
@@ -207,15 +210,17 @@ if (only !== undefined) {
   const { json, chunkSize = 65536, text, run } = workloads.find(w => w.name === only)!;
   const bytes = !text && await acceptsBytes();
   const input = text ? chunks(json, chunkSize) : chunks(new TextEncoder().encode(json), chunkSize);
-  let best = Infinity;
-  for (let i = 0; i < RUNS; i++) {
-    const start = process.threadCpuUsage();
-    const source = text || bytes ? stream<string | Uint8Array>(input) : decode(stream(input as Uint8Array[]));
-    await run(parseValues(source));
-    const { user, system } = process.threadCpuUsage(start);
-    best = Math.min(best, (user + system) / 1e3);
+  const once = () => run(parseValues(text || bytes ? stream<string | Uint8Array>(input) : decode(stream(input as Uint8Array[]))));
+  /** Runs for at least `ms` and returns the number of runs and the elapsed seconds. */
+  async function runFor(ms: number): Promise<[number, number]> {
+    const start = performance.now();
+    let n = 0;
+    while (performance.now() - start < ms) { await once(); n++; }
+    return [n, (performance.now() - start) / 1e3];
   }
-  console.log(json.length / 1e6 / (best / 1e3));
+  await runFor(WARMUP_MS);
+  const [n, seconds] = await runFor(MEASURE_MS);
+  console.log(json.length * n / 1e6 / seconds);
 } else {
   const args = process.argv.slice(2);
   const baseIndex = args.indexOf('--base');
@@ -225,7 +230,7 @@ if (only !== undefined) {
   if (base !== undefined) {
     baseLib = join(tmpdir(), `jsonst-base-${process.pid}.ts`);
     writeFileSync(baseLib, execFileSync('git', ['show', `${base}:src/index.ts`]));
-    console.log(`${''.padEnd(40)} ${base.padStart(8)} ${'current'.padStart(8)} ${'change'.padStart(8)}`);
+    console.log(`${''.padEnd(40)} ${base.padStart(8)} ${'current'.padStart(8)} ${'change'.padStart(8)} ${'spread'.padStart(8)}`);
   }
   const fmt = (x: number) => x.toFixed(0).padStart(8);
   for (const { name } of workloads) {
@@ -243,6 +248,8 @@ if (only !== undefined) {
     }
     const change = (median(after) / median(before) - 1) * 100;
     const changeText = Number.isNaN(change) ? 'n/a' : (change >= 0 ? '+' : '') + change.toFixed(1) + '%';
-    console.log(`${name.padEnd(40)} ${fmt(median(before))} ${fmt(median(after))} ${changeText.padStart(8)}`);
+    // The larger range (max - min) of either side's rounds, relative to its median.
+    const spread = Math.max(...[before, after].map(xs => (Math.max(...xs) - Math.min(...xs)) / median(xs) * 100));
+    console.log(`${name.padEnd(40)} ${fmt(median(before))} ${fmt(median(after))} ${changeText.padStart(8)} ${(spread.toFixed(1) + '%').padStart(8)}`);
   }
 }
