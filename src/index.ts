@@ -559,13 +559,19 @@ type Parser = {
   held: string;
   /** Settles when the operation waiting for input, if any, is done. */
   waiting: Promise<void> | undefined;
+  /** Clears `waiting`. */
+  release: () => void;
 };
 
 function createParser(source: AsyncIterator<Uint8Array | string>): Parser {
-  return {
+  const p: Parser = {
     input: createInput(source), current: ROOT, state: OPENED, key: false, last: ROOT,
     open: [], kinds: [], partial: undefined, held: '', waiting: undefined,
+    release: () => {
+      p.waiting = undefined;
+    },
   };
+  return p;
 }
 
 /**
@@ -604,15 +610,13 @@ async function close(p: Parser): Promise<void> {
   await p.input.w.source.return?.();
 }
 
-/** Makes later operations wait for `result` if it is a promise. */
+/**
+ * Makes later operations wait for `result` if it is a promise. Only an
+ * operation that found no other waiting sets `waiting`, so it is still the
+ * one set when `result` settles.
+ */
 function hold<T>(p: Parser, result: T): T {
-  if (result instanceof Promise) {
-    const release = () => {
-      if (p.waiting === waiting) p.waiting = undefined;
-    };
-    const waiting: Promise<void> = result.then(release, release);
-    p.waiting = waiting;
-  }
+  if (result instanceof Promise) p.waiting = result.then(p.release, p.release);
   return result;
 }
 
@@ -644,7 +648,7 @@ function advance(p: Parser, parent: number, depth: number): Step<number> {
     const end = finishValue(p);
     if (typeof end !== 'number') return end.then(() => advance(p, parent, depth));
   }
-  const c = peek(input);
+  let c = peek(input);
   if (c === MORE) return more(input).then(() => advance(p, parent, depth));
   const kind = depth === ROOT ? ROOT : p.kinds[depth]!;
   if (kind === ROOT) {
@@ -659,7 +663,8 @@ function advance(p: Parser, parent: number, depth: number): Step<number> {
       if (c !== COMMA) throw unexpected(c);
       input.cursor++;
       p.state = AFTER_COMMA;
-      return advance(p, parent, depth);
+      c = peek(input);
+      if (c === MORE) return more(input).then(() => advance(p, parent, depth));
     }
   }
   if (kind === LBRACE) {
@@ -826,6 +831,36 @@ function chunkNow(p: Parser, seq: number): Step<string> {
   }
 }
 
+const TYPE_NAMES: Record<number, string> = { [QUOTE]: 'string', [LBRACKET]: 'array', [LBRACE]: 'object' };
+
+function typeName(first: number): string {
+  return TYPE_NAMES[first] ?? 'number, boolean, or null';
+}
+
+/**
+ * Decodes the escapes in raw contents of a string with complete escapes.
+ * Used for pieces of a string whose closing quote hasn't been tokenized yet.
+ */
+function unescape(raw: string): string {
+  // Most strings have nothing to decode or reject.
+  return /[\\\u0000-\u001f]/.test(raw) ? JSON.parse('"' + raw + '"') : raw;
+}
+
+/**
+ * Returns the length of the longest prefix of raw string contents that does
+ * not end in an incomplete escape sequence.
+ */
+function completeEscapesEnd(raw: string): number {
+  const backslash = raw.lastIndexOf('\\', raw.length - 1);
+  if (backslash === -1 || backslash < raw.length - 6) return raw.length;
+  let start = backslash;
+  while (start > 0 && raw.charCodeAt(start - 1) === BACKSLASH) start--;
+  if ((backslash - start) % 2 === 1) return raw.length; // The last backslash is escaped.
+  const tail = raw.length - backslash - 1;
+  const complete = tail > 0 && (raw[backslash + 1] !== 'u' || tail >= 5);
+  return complete ? raw.length : backslash;
+}
+
 // VALUES /////////////////////////////////////////////////////////////////////
 
 class Value implements JsonStValue {
@@ -881,34 +916,4 @@ class Value implements JsonStValue {
     };
     return new Items(step);
   }
-}
-
-const TYPE_NAMES: Record<number, string> = { [QUOTE]: 'string', [LBRACKET]: 'array', [LBRACE]: 'object' };
-
-function typeName(first: number): string {
-  return TYPE_NAMES[first] ?? 'number, boolean, or null';
-}
-
-/**
- * Decodes the escapes in raw contents of a string with complete escapes.
- * Used for pieces of a string whose closing quote hasn't been tokenized yet.
- */
-function unescape(raw: string): string {
-  // Most strings have nothing to decode or reject.
-  return /[\\\u0000-\u001f]/.test(raw) ? JSON.parse('"' + raw + '"') : raw;
-}
-
-/**
- * Returns the length of the longest prefix of raw string contents that does
- * not end in an incomplete escape sequence.
- */
-function completeEscapesEnd(raw: string): number {
-  const backslash = raw.lastIndexOf('\\', raw.length - 1);
-  if (backslash === -1 || backslash < raw.length - 6) return raw.length;
-  let start = backslash;
-  while (start > 0 && raw.charCodeAt(start - 1) === BACKSLASH) start--;
-  if ((backslash - start) % 2 === 1) return raw.length; // The last backslash is escaped.
-  const tail = raw.length - backslash - 1;
-  const complete = tail > 0 && (raw[backslash + 1] !== 'u' || tail >= 5);
-  return complete ? raw.length : backslash;
 }
