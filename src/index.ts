@@ -596,8 +596,8 @@ function parse(p: Parser, seq: number): unknown {
 }
 
 /**
- * Returns the next decoded piece of the entered string `seq`, or undefined
- * after the last one.
+ * Returns the next decoded piece of the entered string `seq`, or undefined if
+ * there are no more. See `reading` for whether more may follow a piece.
  */
 function chunk(p: Parser, seq: number): Step<string> {
   if (p.waiting !== undefined) return p.waiting.then(() => chunk(p, seq));
@@ -806,9 +806,7 @@ function chunkNow(p: Parser, seq: number): Step<string> {
     const closed = c !== MORE;
     const end = closed ? token(input, input.cursor) : w.end;
     let piece = '';
-    if (w.pin === end && p.partial === undefined) {
-      // Everything has been read, and no decoder holds bytes back.
-    } else if (closed && p.partial === undefined) {
+    if (closed && p.partial === undefined) {
       // The rest of the string arrived at once.
       piece = decodeString(text(w, w.pin, end), special(input, input.cursor));
     } else {
@@ -818,17 +816,20 @@ function chunkNow(p: Parser, seq: number): Step<string> {
       p.held = raw.slice(complete);
       if (complete > 0) piece = unescape(raw.slice(0, complete));
     }
-    w.pin = end;
-    if (piece.length > 0) return piece;
     if (closed) {
-      // The closing quote is consumed only after the last piece, so that the
-      // string ends in a call of its own.
       input.cursor++;
       w.pin = NONE;
       p.state = DONE;
-      return undefined;
+      return piece.length > 0 ? piece : undefined;
     }
+    w.pin = end;
+    if (piece.length > 0) return piece;
   }
+}
+
+/** Whether the entered string `seq` may have more pieces. */
+function reading(p: Parser, seq: number): boolean {
+  return p.current === seq && p.state === STRING;
 }
 
 const TYPE_NAMES: Record<number, string> = { [QUOTE]: 'string', [LBRACKET]: 'array', [LBRACE]: 'object' };
@@ -881,14 +882,23 @@ class Value implements JsonStValue {
   stringChunks(): AsyncIterable<string> {
     const p = this.#p, seq = this.#seq;
     let entered = false;
-    return new Items(() => {
+    /** Whether the last piece has been returned. */
+    let ended = false;
+    const piece = (s: string | undefined) => {
+      ended = !reading(p, seq);
+      return s;
+    };
+    const step = (): Step<string> => {
+      if (ended) return undefined;
       if (!entered) {
         entered = true;
         const started = enter(p, seq, QUOTE);
-        if (started) return started.then(() => chunk(p, seq));
+        if (started) return started.then(step);
       }
-      return chunk(p, seq);
-    });
+      const s = chunk(p, seq);
+      return s instanceof Promise ? s.then(piece) : piece(s);
+    };
+    return new Items(step);
   }
 
   arrayValues(): AsyncIterable<JsonStValue> {
