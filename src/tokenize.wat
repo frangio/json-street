@@ -158,4 +158,28 @@
       (i32.wrap_i64 (i64.or
         (i64.or (local.get $inString) (i64.shl (local.get $escaped) (i64.const 1)))
         (i64.shl (local.get $inScalar) (i64.const 2))))))
+;; Returns the length in UTF-16 code units of the UTF-8 text at [pos, end):
+  ;; one unit per byte that starts a character, plus one more for each 4-byte
+  ;; character. Reads up to 15 bytes past `end`.
+  (func (export "utf16Length") (param $pos i32) (param $end i32) (result i32)
+    (local $n i32) (local $v v128) (local $valid i32) (local $left i32)
+    (block $done
+      (loop $parts
+        (br_if $done (i32.ge_u (local.get $pos) (local.get $end)))
+        (local.set $v (v128.load (local.get $pos)))
+        (local.set $left (i32.sub (local.get $end) (local.get $pos)))
+        (local.set $valid (select (i32.const 0xffff)
+          (i32.sub (i32.shl (i32.const 1) (local.get $left)) (i32.const 1))
+          (i32.ge_u (local.get $left) (i32.const 16))))
+        (local.set $n (i32.add (local.get $n)
+          (i32.add
+            (i32.popcnt (i32.and (local.get $valid) (i32.xor (i32.const -1) (i8x16.bitmask
+              (i8x16.eq
+                (v128.and (local.get $v) (i8x16.splat (i32.const 0xc0)))
+                (i8x16.splat (i32.const 0x80)))))))
+            (i32.popcnt (i32.and (local.get $valid) (i8x16.bitmask
+              (i8x16.ge_u (local.get $v) (i8x16.splat (i32.const 0xf0)))))))))
+        (local.set $pos (i32.add (local.get $pos) (i32.const 16)))
+        (br $parts)))
+    (local.get $n))
 )

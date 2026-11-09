@@ -258,6 +258,17 @@ test('large input in small chunks', async () => {
   }
 });
 
+test('invalid UTF-8 becomes U+FFFD', async () => {
+  const bytes = [...new TextEncoder().encode('[1,"a'), 0x80, 0x80, ...new TextEncoder().encode('b",[2],"c'), 0xe2, 0x82, ...new TextEncoder().encode('"]')];
+  const expected = [[1, 'a\ufffd\ufffdb', [2], 'c\ufffd']];
+  assert.deepEqual(await readAll([Uint8Array.from(bytes)], v => v.parse()), expected);
+  const values = [];
+  for await (const value of parseValues(stream(Uint8Array.from(bytes)))) {
+    for await (const item of value.arrayValues()) values.push(await item.parse());
+  }
+  assert.deepEqual(values, expected[0]);
+});
+
 test('multiple top-level values', async () => {
   assert.deepEqual(await readAll(['1 "a"[]{}', 'null\n', '2'], v => v.parse()), [1, 'a', [], {}, null, 2]);
   assert.deepEqual(await readAll([' \n '], v => v.parse()), []);

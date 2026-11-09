@@ -170,15 +170,25 @@ type Input = {
   ended: boolean;
   /** A high surrogate held back from the end of a text chunk. */
   surrogate: string;
+  utf16Length: (pos: number, end: number) => number;
+  /**
+   * The bytes at [textStart, textEnd) decoded, and a byte address in that
+   * range with the index of its character in the text.
+   */
+  text: string;
+  textStart: number;
+  textEnd: number;
+  textByte: number;
+  textIndex: number;
 };
 
 function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
   const memory = new WebAssembly.Memory({ initial: 4 });
   const input: Input = {
     chunks, memory, bytes: new Uint8Array(), tokens: new Uint32Array(),
-    tokenize: tokenizer(memory),
+    ...tokenizer(memory),
     len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE,
-    ended: false, surrogate: '',
+    ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
   };
   renewViews(input);
   return input;
@@ -268,6 +278,7 @@ function reserve(input: Input, n: number): void {
   input.len -= shift;
   input.scanned -= shift;
   input.mark -= shift;
+  input.textEnd = 0;
   const missing = input.len + n - input.bytes.length;
   if (missing > 0) {
     input.memory.grow(Math.ceil(Math.max(missing, input.bytes.length) / PAGE));
@@ -337,7 +348,37 @@ function parseValue(input: Input): unknown {
 function parseMarked(input: Input, end: number): unknown {
   const { bytes, mark } = input;
   input.mark = NONE;
-  return bytes[mark] === QUOTE ? decodeString(bytes, mark + 1, end - 1) : JSON.parse(decodeText(bytes, mark, end));
+  // Strings aren't sliced from the decoded text, which would keep it alive.
+  return bytes[mark] === QUOTE ? decodeString(bytes, mark + 1, end - 1) : JSON.parse(valueText(input, mark, end));
+}
+
+/**
+ * Returns the bytes at [start, end), which start and end at characters,
+ * decoded. The buffered bytes are decoded at once, avoiding the fixed cost of
+ * decoding each value, and values are sliced from the text. Values are read
+ * in order, so byte addresses are mapped to text indices incrementally.
+ */
+function valueText(input: Input, start: number, end: number): string {
+  if (start < input.textStart || end > input.textEnd) {
+    // A character split at the end of the buffered bytes comes after `end`,
+    // so how it is decoded doesn't matter.
+    const text = decoder.decode(input.bytes.subarray(start, input.len));
+    // Invalid UTF-8 is decoded in a way the mapping doesn't follow.
+    input.text = text.length === input.utf16Length(start, input.len) ? text : '';
+    input.textStart = input.textByte = start;
+    input.textEnd = input.len;
+    input.textIndex = 0;
+  }
+  if (input.text === '') return decodeText(input.bytes, start, end);
+  if (start < input.textByte) {
+    input.textByte = input.textStart;
+    input.textIndex = 0;
+  }
+  const from = input.textIndex + input.utf16Length(input.textByte, start);
+  const to = from + input.utf16Length(start, end);
+  input.textByte = end;
+  input.textIndex = to;
+  return input.text.slice(from, to);
 }
 
 /**
@@ -375,13 +416,14 @@ function decodeText(bytes: Uint8Array, start: number, end: number): string {
 }
 
 /** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
-const TOKENIZER = 'AGFzbQEAAAABEQJgAX8Efn5+fmAEf39/fwF/Ag8BA2VudgZtZW1vcnkCAAEDAwIAAQcMAQh0b2tlbml6ZQABCpwFAs8BBAF/AX4DewR+A0AgACABav0ABAAhAyADQSD9D/1QIQQgA0Es/Q/9IyADQTr9D/0j/VAgBEH7AP0P/SMgBEH9AP0P/SP9UP1QIQUgAa0hAiAGIANBIv0P/SP9ZK0gAoaEIQYgByADQdwA/Q/9I/1krSAChoQhByAIIAX9ZK0gAoaEIQggCSAFIANBIP0P/SMgA0EJ/Q/9I/1QIANBCv0P/SMgA0EN/Q/9I/1Q/VD9UP1krSAChoQhCSABQRBqIgFBwABJDQALIAYgByAIIAkLyAMCAn8QfiADIQQgAEEBca0hDCAAQQF2QQFxrSENIABBAnatIQ4CQANAIAEgAk8NASACIAFrIQUgBUHAAE8EQEHAACEFQn8hBwVCASAFrYZCAX0hBwsgBUEBa60hBiABEAAhCyEKIQkhCCAJIAeDIQkgCSAJQgGGQn+FgyEPQtWq1arVqtWq1QAgDYUhECAJIA8gEEJ/hYN8IREgCUJ/hSAJIA8gEIN8QqrVqtWq1arVqn+DIBEgDYRC1arVqtWq1arVAIOEgyESIBEgCVStIBIgBa2IQgGDIAVBwABGGyENIAggB4MgEkJ/hYMhCCAIIRMgEyATQgGGhSETIBMgE0IChoUhEyATIBNCBIaFIRMgEyATQgiGhSETIBMgE0IQhoUhEyATIBNCIIaFIRMgE0IAIAx9hSETIBMgBohCAYMhDCAHIAggC4QgE4RCf4WDIRQgCCAKIAeDIBNCf4WDhCAUIBRCAYYgDoRCf4WDhCEVIBQgBohCAYMhDgJAA0AgFVANASADIAEgFXqnajYCACADQQRqIQMgFSAVQgF9gyEVDAALCyABQcAAaiEBDAALCyADIARrQQF0IAwgDUIBhoQgDkIChoSncgs=';
+const TOKENIZER = 'AGFzbQEAAAABFwNgAX8Efn5+fmAEf39/fwF/YAJ/fwF/Ag8BA2VudgZtZW1vcnkCAAEDBAMAAQIHGgIIdG9rZW5pemUAAQt1dGYxNkxlbmd0aAACCo4GA88BBAF/AX4DewR+A0AgACABav0ABAAhAyADQSD9D/1QIQQgA0Es/Q/9IyADQTr9D/0j/VAgBEH7AP0P/SMgBEH9AP0P/SP9UP1QIQUgAa0hAiAGIANBIv0P/SP9ZK0gAoaEIQYgByADQdwA/Q/9I/1krSAChoQhByAIIAX9ZK0gAoaEIQggCSAFIANBIP0P/SMgA0EJ/Q/9I/1QIANBCv0P/SMgA0EN/Q/9I/1Q/VD9UP1krSAChoQhCSABQRBqIgFBwABJDQALIAYgByAIIAkLyAMCAn8QfiADIQQgAEEBca0hDCAAQQF2QQFxrSENIABBAnatIQ4CQANAIAEgAk8NASACIAFrIQUgBUHAAE8EQEHAACEFQn8hBwVCASAFrYZCAX0hBwsgBUEBa60hBiABEAAhCyEKIQkhCCAJIAeDIQkgCSAJQgGGQn+FgyEPQtWq1arVqtWq1QAgDYUhECAJIA8gEEJ/hYN8IREgCUJ/hSAJIA8gEIN8QqrVqtWq1arVqn+DIBEgDYRC1arVqtWq1arVAIOEgyESIBEgCVStIBIgBa2IQgGDIAVBwABGGyENIAggB4MgEkJ/hYMhCCAIIRMgEyATQgGGhSETIBMgE0IChoUhEyATIBNCBIaFIRMgEyATQgiGhSETIBMgE0IQhoUhEyATIBNCIIaFIRMgE0IAIAx9hSETIBMgBohCAYMhDCAHIAggC4QgE4RCf4WDIRQgCCAKIAeDIBNCf4WDhCAUIBRCAYYgDoRCf4WDhCEVIBQgBohCAYMhDgJAA0AgFVANASADIAEgFXqnajYCACADQQRqIQMgFSAVQgF9gyEVDAALCyABQcAAaiEBDAALCyADIARrQQF0IAwgDUIBhoQgDkIChoSncgtxAwF/AXsCfwJAA0AgACABTw0BIAD9AAQAIQMgASAAayEFQf//A0EBIAV0QQFrIAVBEE8bIQQgAiAEQX8gA0HAAf0P/U5BgAH9D/0j/WRzcWkgBCADQfAB/Q/9LP1kcWlqaiECIABBEGohAAwACwsgAgs=';
 
 const tokenizerModule = new WebAssembly.Module(Uint8Array.from(atob(TOKENIZER), c => c.charCodeAt(0)));
 
 /** Instantiates the tokenizer to operate on `memory`. */
-function tokenizer(memory: WebAssembly.Memory): Tokenize {
-  return new WebAssembly.Instance(tokenizerModule, { env: { memory } }).exports.tokenize as Tokenize;
+function tokenizer(memory: WebAssembly.Memory): Pick<Input, 'tokenize' | 'utf16Length'> {
+  const { tokenize, utf16Length } = new WebAssembly.Instance(tokenizerModule, { env: { memory } }).exports;
+  return { tokenize: tokenize as Input['tokenize'], utf16Length: utf16Length as Input['utf16Length'] };
 }
 
 // VALUES /////////////////////////////////////////////////////////////////////
