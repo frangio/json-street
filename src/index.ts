@@ -884,10 +884,6 @@ class Value implements JsonStValue {
     let entered = false;
     /** Whether the last piece has been returned. */
     let ended = false;
-    const piece = (s: string | undefined) => {
-      ended = !reading(p, seq);
-      return s;
-    };
     const step = (): Step<string> => {
       if (ended) return undefined;
       if (!entered) {
@@ -895,23 +891,28 @@ class Value implements JsonStValue {
         const started = enter(p, seq, QUOTE);
         if (started) return started.then(step);
       }
-      const s = chunk(p, seq);
-      return s instanceof Promise ? s.then(piece) : piece(s);
+      const piece = chunk(p, seq);
+      if (piece instanceof Promise) {
+        return piece.then(piece => {
+          ended = !reading(p, seq);
+          return piece;
+        });
+      }
+      ended = !reading(p, seq);
+      return piece;
     };
     return new Items(step);
   }
 
   arrayValues(): AsyncIterable<JsonStValue> {
-    const p = this.#p, depth = this.#depth + 1;
-    return this.#children(LBRACKET, seq => new Value(p, seq, depth));
+    return this.#children(LBRACKET);
   }
 
   objectEntries(): AsyncIterable<[key: JsonStValue, value: JsonStValue]> {
-    const p = this.#p, depth = this.#depth + 1;
-    return this.#children(LBRACE, seq => [new Value(p, seq, depth), new Value(p, seq + 1, depth)]);
+    return this.#children(LBRACE);
   }
 
-  #children<T>(kind: number, item: (seq: number) => T): AsyncIterable<T> {
+  #children<T>(kind: number): AsyncIterable<T> {
     const p = this.#p, seq = this.#seq, depth = this.#depth;
     let entered = false;
     const step = (): Step<T> => {
@@ -921,9 +922,15 @@ class Value implements JsonStValue {
         if (started) return started.then(step);
       }
       const child = next(p, seq, depth);
-      if (child instanceof Promise) return child.then(child => child === undefined ? undefined : item(child));
-      return child === undefined ? undefined : item(child);
+      if (child instanceof Promise) return child.then(child => item(p, kind, child, depth + 1));
+      return item(p, kind, child, depth + 1);
     };
     return new Items(step);
   }
+}
+
+/** The item of an iterator over the children of `kind` for child `seq`. */
+function item<T>(p: Parser, kind: number, seq: number | undefined, depth: number): T | undefined {
+  if (seq === undefined) return undefined;
+  return (kind === LBRACE ? [new Value(p, seq, depth), new Value(p, seq + 1, depth)] : new Value(p, seq, depth)) as T;
 }
