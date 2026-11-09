@@ -195,11 +195,12 @@ type Input = {
   /** The earliest byte the consumer still needs, or NONE. */
   mark: number;
   /**
-   * The text of the value at `mark` before it, dropped from the buffer, and
-   * the decoder holding the bytes of a character split at `mark`.
+   * The bytes of the value at `mark` before it, dropped from the buffer, and
+   * their number. They are decoded with the rest of the value, because
+   * JSON.parse would copy text joined from pieces.
    */
-  spill: string;
-  spillDecoder: TextDecoder;
+  spill: Uint8Array[];
+  spilled: number;
   ended: boolean;
   /** A high surrogate held back from the end of a text chunk. */
   surrogate: string;
@@ -223,7 +224,7 @@ function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
     tokens: new Uint16Array(memory.buffer, 0, TOKENS),
     links: new Uint16Array(memory.buffer, LINKS, TOKENS),
     ...tokenizer(memory),
-    base: 0, len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE, spill: '', spillDecoder: new TextDecoder('utf-8', { ignoreBOM: true }),
+    base: 0, len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE, spill: [], spilled: 0,
     ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
   };
 }
@@ -298,15 +299,15 @@ async function more(input: Input): Promise<void> {
 }
 
 /**
- * Moves the bytes still needed to the start of the buffer, first decoding
+ * Moves the bytes still needed to the start of the buffer, first copying
  * those of a value being parsed to `spill` if they fill more than half of it.
  */
 function drop(input: Input): void {
   const { bytes, len } = input;
   let keep = Math.min(input.mark, len);
   if (len - keep > BUFFER / 2) {
-    // The decoder keeps a character split at the end for the next decode.
-    input.spill += input.spillDecoder.decode(bytes.subarray(keep, len), { stream: true });
+    input.spill.push(bytes.slice(keep, len));
+    input.spilled += len - keep;
     keep = input.mark = len;
   }
   const shift = keep - BYTES;
@@ -409,10 +410,17 @@ function parseValue(input: Input): unknown {
 function parseMarked(input: Input, end: number): unknown {
   const { bytes, mark, spill } = input;
   input.mark = NONE;
-  if (spill !== '') {
-    input.spill = '';
-    const text = spill + input.spillDecoder.decode(bytes.subarray(mark, end & ADDRESS));
-    return spill.charCodeAt(0) === 0x22 && end < SPECIAL ? text.slice(1, -1) : JSON.parse(text);
+  if (spill.length > 0) {
+    const all = new Uint8Array(input.spilled + (end & ADDRESS) - mark);
+    let at = 0;
+    for (const piece of spill) {
+      all.set(piece, at);
+      at += piece.length;
+    }
+    all.set(bytes.subarray(mark, end & ADDRESS), at);
+    input.spill = [];
+    input.spilled = 0;
+    return all[0] === QUOTE ? decodeString(all, 1, all.length - 1, end >= SPECIAL) : JSON.parse(decoder.decode(all));
   }
   // Strings aren't sliced from the decoded text, which would keep it alive.
   return bytes[mark] === QUOTE
