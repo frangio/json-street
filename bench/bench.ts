@@ -143,6 +143,7 @@ const workloads: Workload[] = [
   },
   { name: 'parse each array element', json: recordsJson, run: parseEach },
   { name: 'parse each array element, 1 KB chunks', json: recordsJson, chunkSize: 1024, run: parseEach },
+  { name: 'parse each array element, 1 MB chunks', json: recordsJson, chunkSize: 1 << 20, run: parseEach },
   {
     name: 'parse each NDJSON line',
     json: ndjson,

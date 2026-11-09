@@ -151,24 +151,29 @@ type Tokenize = (state: number, pos: number, end: number) => number;
 /**
  * 16-bit words in the token region at the start of memory. It is followed by
  * the links of brackets, the tokenizer's stack of open brackets (both of the
- * same size, see tokenize.wat), and the bytes.
+ * same size, see tokenize.wat), and BUFFER bytes of input.
  */
 const TOKENS = 16384;
 const LINKS = TOKENS * 2;
 const BYTES = TOKENS * 6;
+const BUFFER = 65536;
 /** Bytes past the buffered ones that the tokenizer may read. */
 const SLACK = 64;
 const PAGE = 65536;
 const NONE = Infinity;
 
 /**
- * The bytes of the stream and their tokens, hiding chunk boundaries. Fields
- * holding addresses (`len`, `scanned`, `mark`) are updated when bytes move.
+ * The bytes of the stream and their tokens, hiding chunk boundaries. The
+ * memory has a fixed size: chunks are copied in as space allows, and the
+ * bytes of a value being parsed that would fill more than half the buffer are
+ * decoded to `spill`. Fields holding addresses (`len`, `scanned`, `mark`) are
+ * updated when bytes move.
  */
 type Input = {
   chunks: AsyncIterator<Uint8Array | string>;
-  memory: WebAssembly.Memory;
-  /** Views of memory, renewed when it grows. */
+  /** The part of the last chunk not copied yet, from `pendingPos`. */
+  pending: Uint8Array | string | undefined;
+  pendingPos: number;
   bytes: Uint8Array;
   tokens: Uint16Array;
   /**
@@ -189,6 +194,12 @@ type Input = {
   count: number;
   /** The earliest byte the consumer still needs, or NONE. */
   mark: number;
+  /**
+   * The text of the value at `mark` before it, dropped from the buffer, and
+   * the decoder holding the bytes of a character split at `mark`.
+   */
+  spill: string;
+  spillDecoder: TextDecoder;
   ended: boolean;
   /** A high surrogate held back from the end of a text chunk. */
   surrogate: string;
@@ -205,24 +216,16 @@ type Input = {
 };
 
 function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
-  // The smallest memory that holds the regions before the bytes and a 16 KB
-  // chunk, the most an HTTPS response in Node delivers at once. It grows to
-  // fit larger chunks.
-  const memory = new WebAssembly.Memory({ initial: Math.ceil((BYTES + 16384 + SLACK) / PAGE) });
-  const input: Input = {
-    chunks, memory, bytes: new Uint8Array(), tokens: new Uint16Array(), links: new Uint16Array(), base: 0,
+  const memory = new WebAssembly.Memory({ initial: Math.ceil((BYTES + BUFFER + SLACK) / PAGE) });
+  return {
+    chunks, pending: undefined, pendingPos: 0,
+    bytes: new Uint8Array(memory.buffer),
+    tokens: new Uint16Array(memory.buffer, 0, TOKENS),
+    links: new Uint16Array(memory.buffer, LINKS, TOKENS),
     ...tokenizer(memory),
-    len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE,
+    base: 0, len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE, spill: '', spillDecoder: new TextDecoder('utf-8', { ignoreBOM: true }),
     ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
   };
-  renewViews(input);
-  return input;
-}
-
-function renewViews(input: Input): void {
-  input.bytes = new Uint8Array(input.memory.buffer);
-  input.tokens = new Uint16Array(input.memory.buffer, 0, TOKENS);
-  input.links = new Uint16Array(input.memory.buffer, LINKS, TOKENS);
 }
 
 // Functions that may have to wait for input return a promise only when they
@@ -268,55 +271,69 @@ function scan(input: Input): boolean {
   return true;
 }
 
-/** Waits for the next chunk. */
+/**
+ * Buffers more input, waiting for the next chunk if the last one has been
+ * copied. Must be called with every buffered byte tokenized and every token
+ * consumed.
+ */
 async function more(input: Input): Promise<void> {
-  const { done, value } = await input.chunks.next();
-  if (!done) {
-    append(input, value);
-  } else {
-    input.ended = true;
-    if (input.surrogate) append(input, '');
-  }
-}
-
-function append(input: Input, chunk: Uint8Array | string): void {
-  if (typeof chunk === 'string') {
-    // A surrogate pair split across chunks can't be encoded separately.
-    chunk = input.surrogate + chunk;
-    input.surrogate = '';
-    const last = chunk.charCodeAt(chunk.length - 1);
-    if (last >= 0xd800 && last < 0xdc00 && !input.ended) {
-      input.surrogate = chunk.slice(-1);
-      chunk = chunk.slice(0, -1);
+  if (input.pending === undefined) {
+    const { done, value } = await input.chunks.next();
+    let chunk = value;
+    if (done) {
+      input.ended = true;
+      chunk = input.surrogate;
+    } else if (typeof chunk === 'string') {
+      // A surrogate pair split across chunks can't be encoded separately.
+      chunk = input.surrogate + chunk;
+      const last = chunk.charCodeAt(chunk.length - 1);
+      input.surrogate = last >= 0xd800 && last < 0xdc00 ? chunk.slice(-1) : '';
+      if (input.surrogate) chunk = chunk.slice(0, -1);
     }
-    reserve(input, chunk.length * 3);
-    input.len += encoder.encodeInto(chunk, input.bytes.subarray(input.len)).written;
-  } else {
-    reserve(input, chunk.length);
-    input.bytes.set(chunk, input.len);
-    input.len += chunk.length;
+    input.pending = chunk;
+    input.pendingPos = 0;
   }
+  drop(input);
+  fill(input);
 }
 
 /**
- * Makes room for `n` more bytes, dropping the bytes that are no longer needed
- * or growing the memory. Must be called with every token consumed.
+ * Moves the bytes still needed to the start of the buffer, first decoding
+ * those of a value being parsed to `spill` if they fill more than half of it.
  */
-function reserve(input: Input, n: number): void {
-  n += SLACK;
-  if (input.len + n <= input.bytes.length) return;
-  const keep = Math.min(input.mark, input.scanned);
+function drop(input: Input): void {
+  const { bytes, len } = input;
+  let keep = Math.min(input.mark, len);
+  if (len - keep > BUFFER / 2) {
+    // The decoder keeps a character split at the end for the next decode.
+    input.spill += input.spillDecoder.decode(bytes.subarray(keep, len), { stream: true });
+    keep = input.mark = len;
+  }
   const shift = keep - BYTES;
-  input.bytes.copyWithin(BYTES, keep, input.len);
+  bytes.copyWithin(BYTES, keep, len);
   input.len -= shift;
   input.scanned -= shift;
   input.mark -= shift;
   input.textEnd = 0;
-  const missing = input.len + n - input.bytes.length;
-  if (missing > 0) {
-    input.memory.grow(Math.ceil(Math.max(missing, input.bytes.length) / PAGE));
-    renewViews(input);
+}
+
+/** Copies as much of the pending chunk as fits in the buffer. */
+function fill(input: Input): void {
+  const chunk = input.pending!;
+  const pos = input.pendingPos;
+  const space = input.bytes.subarray(input.len, BYTES + BUFFER);
+  let read;
+  if (typeof chunk === 'string') {
+    const result = encoder.encodeInto(pos === 0 ? chunk : chunk.slice(pos), space);
+    read = result.read;
+    input.len += result.written;
+  } else {
+    read = Math.min(space.length, chunk.length - pos);
+    space.set(pos === 0 && read === chunk.length ? chunk : chunk.subarray(pos, pos + read));
+    input.len += read;
   }
+  input.pendingPos += read;
+  if (input.pendingPos === chunk.length) input.pending = undefined;
 }
 
 /**
@@ -390,8 +407,13 @@ function parseValue(input: Input): unknown {
 }
 
 function parseMarked(input: Input, end: number): unknown {
-  const { bytes, mark } = input;
+  const { bytes, mark, spill } = input;
   input.mark = NONE;
+  if (spill !== '') {
+    input.spill = '';
+    const text = spill + input.spillDecoder.decode(bytes.subarray(mark, end & ADDRESS));
+    return spill.charCodeAt(0) === 0x22 && end < SPECIAL ? text.slice(1, -1) : JSON.parse(text);
+  }
   // Strings aren't sliced from the decoded text, which would keep it alive.
   return bytes[mark] === QUOTE
     ? decodeString(bytes, mark + 1, (end & ADDRESS) - 1, end >= SPECIAL)

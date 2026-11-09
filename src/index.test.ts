@@ -265,12 +265,13 @@ test('long strings with escapes at every offset', async () => {
   }
 });
 
-test('large input in small chunks', async () => {
-  // Fills the buffer many times while values that span chunks are in use.
+test('large input in small chunks and in one chunk', async () => {
+  // Fills the buffer many times while values that span chunks are in use,
+  // and copies a chunk larger than the buffer in parts.
   const items = Array.from({ length: 3000 }, (_, i) => ({ i, s: 'é😀\\n'.repeat(i % 300) }));
   const text = JSON.stringify(items);
-  for (const bytes of [false, true]) {
-    const chunks = split(text, Array.from({ length: text.length / 997 }, (_, i) => i * 997), bytes);
+  for (const [bytes, step] of [[false, 997], [true, 997], [false, Infinity], [true, Infinity]] as const) {
+    const chunks = split(text, Array.from({ length: Math.ceil(text.length / step) }, (_, i) => i * step), bytes);
     assert.deepEqual(await readAll(chunks, v => v.parse()), [items]);
     assert.deepEqual(await readAll(chunks, read), [items]);
     const parsed = [];
