@@ -134,7 +134,15 @@ const BUFFER = 65536;
  */
 const IN_STRING = 1;
 
-/** A tokenizer with its own memory. Positions are indices into `bytes`. */
+/**
+ * A tokenizer with its own memory. Positions are indices into `bytes`.
+ *
+ * Tokenizing is a function of a state and bytes, and splitting the bytes
+ * doesn't change the result: tokenizing A ++ B after state σ gives the tokens
+ * of A, then those of B (offset by |A|) after the state that A ends in. Links
+ * are the exception: they are hints, present only when both brackets fall in
+ * the same call.
+ */
 type Tokenizer = {
   /** BUFFER bytes for the caller to fill with the stream. */
   bytes: Uint8Array;
