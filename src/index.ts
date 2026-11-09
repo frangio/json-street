@@ -205,7 +205,10 @@ type Input = {
 };
 
 function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
-  const memory = new WebAssembly.Memory({ initial: 4 });
+  // The smallest memory that holds the regions before the bytes and a 16 KB
+  // chunk, the most an HTTPS response in Node delivers at once. It grows to
+  // fit larger chunks.
+  const memory = new WebAssembly.Memory({ initial: Math.ceil((BYTES + 16384 + SLACK) / PAGE) });
   const input: Input = {
     chunks, memory, bytes: new Uint8Array(), tokens: new Uint16Array(), links: new Uint16Array(), base: 0,
     ...tokenizer(memory),
