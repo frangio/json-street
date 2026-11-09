@@ -800,8 +800,10 @@ function chunkNow(p: Parser, seq: number): Step<string> {
     if (c === MORE && w.pin === w.end) return more(input).then(() => chunkNow(p, seq));
     const closed = c !== MORE;
     const end = closed ? token(input, input.cursor) : w.end;
-    let piece;
-    if (closed && p.partial === undefined) {
+    let piece = '';
+    if (w.pin === end && p.partial === undefined) {
+      // Everything has been read, and no decoder holds bytes back.
+    } else if (closed && p.partial === undefined) {
       // The rest of the string arrived at once.
       piece = decodeString(text(w, w.pin, end), special(input, input.cursor));
     } else {
@@ -809,7 +811,7 @@ function chunkNow(p: Parser, seq: number): Step<string> {
       const raw = p.held + p.partial.decode(input.bytes.subarray(w.pin - w.origin, end - w.origin), { stream: !closed });
       const complete = closed ? raw.length : completeEscapesEnd(raw);
       p.held = raw.slice(complete);
-      piece = complete > 0 ? unescape(raw.slice(0, complete)) : '';
+      if (complete > 0) piece = unescape(raw.slice(0, complete));
     }
     w.pin = end;
     if (piece.length > 0) return piece;

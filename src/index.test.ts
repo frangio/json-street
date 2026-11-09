@@ -291,6 +291,9 @@ test('invalid UTF-8 becomes U+FFFD', async () => {
     for await (const item of value.arrayValues()) values.push(await item.parse());
   }
   assert.deepEqual(values, expected[0]);
+  // A string that spans chunks and ends in a cut-short character.
+  const cut = bytes.length - 2;
+  assert.deepEqual(await readAll([Uint8Array.from(bytes.slice(0, cut)), Uint8Array.from(bytes.slice(cut))], read), expected);
 });
 
 test('multiple top-level values', async () => {
