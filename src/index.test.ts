@@ -50,6 +50,27 @@ async function read(value: JsonStValue): Promise<unknown> {
   return value.parse();
 }
 
+/** Reads arrays and objects through iterators, and parses everything else. */
+async function readLeaves(value: JsonStValue): Promise<unknown> {
+  try {
+    const items = [];
+    for await (const item of value.arrayValues()) items.push(await readLeaves(item));
+    return items;
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;
+  }
+  try {
+    const obj: Record<string, unknown> = {};
+    for await (const [k, v] of value.objectEntries()) {
+      Object.defineProperty(obj, await k.parse() as string, { value: await readLeaves(v), enumerable: true });
+    }
+    return obj;
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;
+  }
+  return value.parse();
+}
+
 async function readAll(chunks: Chunk[], read: (v: JsonStValue) => Promise<unknown>): Promise<unknown[]> {
   const values = [];
   for await (const value of parseValues(stream(...chunks))) values.push(await read(value));
@@ -66,6 +87,7 @@ const cuts = fc.array(fc.nat(), { maxLength: 20 });
 test('streaming methods agree with JSON.parse', async () => {
   await fc.assert(fc.asyncProperty(json, cuts, fc.boolean(), async (text, cuts, bytes) => {
     assert.deepEqual(await readAll(split(text, cuts, bytes), read), [JSON.parse(text)]);
+    assert.deepEqual(await readAll(split(text, cuts, bytes), readLeaves), [JSON.parse(text)]);
   }));
 });
 
@@ -206,6 +228,7 @@ test('every split of tricky input', async () => {
     for (let j = i; j <= text.length; j++) {
       const chunks = split(text, [i, j]);
       assert.deepEqual(await readAll(chunks, read), expected, chunks.join('|'));
+      assert.deepEqual(await readAll(chunks, readLeaves), expected, chunks.join('|'));
       assert.deepEqual(await readAll(chunks, v => v.parse()), expected, chunks.join('|'));
     }
   }

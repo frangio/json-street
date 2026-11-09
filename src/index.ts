@@ -123,17 +123,22 @@ const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 // is the address of a byte that starts something: a bracket, comma, or colon,
 // either quote of a string, or the first byte of a number, boolean, or null.
 // The kind of a token is the byte it points to. A number, boolean, or null
-// ends at the next token or the end of the stream.
+// ends at the next token or the end of the stream. The token of a closing
+// quote has the SPECIAL bit set if the string has a backslash or a control
+// character, so it must be unescaped or rejected rather than just decoded.
+
+const SPECIAL = 0x80000000;
+const ADDRESS = 0x7fffffff;
 
 /**
  * Tokenizer state: inside a string, after an odd number of backslashes,
- * inside a scalar.
+ * inside a scalar, inside a string that has had a special character.
  */
 const IN_STRING = 1;
 
 /**
  * Tokenizes the bytes at [pos, end) starting in `state`, writing the tokens
- * as 32-bit words at `out`. Returns the number of tokens times 8 plus the
+ * as 32-bit words at `out`. Returns the number of tokens times 16 plus the
  * state at `end`.
  */
 type Tokenize = (state: number, pos: number, end: number, out: number) => number;
@@ -212,7 +217,7 @@ function peek(input: Input): number {
     if (input.state & IN_STRING) throw unexpected(EOF);
     return EOF;
   }
-  return input.bytes[input.tokens[input.cursor]!]!;
+  return input.bytes[input.tokens[input.cursor]! & ADDRESS]!;
 }
 
 /**
@@ -228,8 +233,8 @@ function scan(input: Input): boolean {
     input.count = 0;
     const end = Math.min(input.len, input.scanned + TOKENS);
     const result = input.tokenize(input.state, input.scanned, end, 0);
-    input.count = result >>> 3;
-    input.state = result & 7;
+    input.count = result >>> 4;
+    input.state = result & 15;
     input.scanned = end;
   }
   return true;
@@ -288,7 +293,8 @@ function reserve(input: Input, n: number): void {
 
 /**
  * Consumes the value that starts at the next token, returning the address
- * right after it. Returns a promise if it has to wait for input.
+ * right after it, with the SPECIAL bit for a string. Returns a promise if it
+ * has to wait for input.
  */
 function consumeValue(input: Input): number | Promise<number> {
   const c = input.bytes[input.tokens[input.cursor++]!]!;
@@ -297,7 +303,10 @@ function consumeValue(input: Input): number | Promise<number> {
   return scalarEnd(input);
 }
 
-/** Consumes the closing quote of a string, returning the address after it. */
+/**
+ * Consumes the closing quote of a string, returning the address after it,
+ * with the SPECIAL bit of the closing quote.
+ */
 function exitString(input: Input): number | Promise<number> {
   // Inside a string the only token is the closing quote, and peek fails if
   // the input ends first.
@@ -320,7 +329,7 @@ function exitContainer(input: Input, depth: number): number | Promise<number> {
   for (;;) {
     const { bytes, tokens, count } = input;
     for (let i = input.cursor; i < count; i++) {
-      const c = bytes[tokens[i]!]!;
+      const c = bytes[tokens[i]! & ADDRESS]!;
       if (c === LBRACKET || c === LBRACE) {
         depth++;
       } else if ((c === RBRACKET || c === RBRACE) && --depth === 0) {
@@ -349,7 +358,9 @@ function parseMarked(input: Input, end: number): unknown {
   const { bytes, mark } = input;
   input.mark = NONE;
   // Strings aren't sliced from the decoded text, which would keep it alive.
-  return bytes[mark] === QUOTE ? decodeString(bytes, mark + 1, end - 1) : JSON.parse(valueText(input, mark, end));
+  return bytes[mark] === QUOTE
+    ? decodeString(bytes, mark + 1, (end & ADDRESS) - 1, end >= SPECIAL)
+    : JSON.parse(valueText(input, mark, end));
 }
 
 /**
@@ -385,20 +396,12 @@ function valueText(input: Input, start: number, end: number): string {
 }
 
 /**
- * Decodes the contents of a string at [start, end), which must be complete.
- * Short strings without escapes are decoded in one pass in JavaScript.
+ * Decodes the contents of a complete string at [start, end), parsing it if
+ * it has `special` characters, to unescape them or reject control characters.
  */
-function decodeString(bytes: Uint8Array, start: number, end: number): string {
-  if (end - start <= 16) {
-    let text = '';
-    for (let i = start; i < end; i++) {
-      const c = bytes[i]!;
-      if (c >= 0x80 || c === BACKSLASH || c < 0x20) return unescape(decodeText(bytes, start, end));
-      text += String.fromCharCode(c);
-    }
-    return text;
-  }
-  return unescape(decodeText(bytes, start, end));
+function decodeString(bytes: Uint8Array, start: number, end: number, special: boolean): string {
+  const raw = decodeText(bytes, start, end);
+  return special ? JSON.parse('"' + raw + '"') : raw;
 }
 
 /**
@@ -419,7 +422,7 @@ function decodeText(bytes: Uint8Array, start: number, end: number): string {
 }
 
 /** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
-const TOKENIZER = 'AGFzbQEAAAABFwNgAX8Efn5+fmAEf39/fwF/YAJ/fwF/Ag8BA2VudgZtZW1vcnkCAAEDBAMAAQIHGgIIdG9rZW5pemUAAQt1dGYxNkxlbmd0aAACCo4GA88BBAF/AX4DewR+A0AgACABav0ABAAhAyADQSD9D/1QIQQgA0Es/Q/9IyADQTr9D/0j/VAgBEH7AP0P/SMgBEH9AP0P/SP9UP1QIQUgAa0hAiAGIANBIv0P/SP9ZK0gAoaEIQYgByADQdwA/Q/9I/1krSAChoQhByAIIAX9ZK0gAoaEIQggCSAFIANBIP0P/SMgA0EJ/Q/9I/1QIANBCv0P/SMgA0EN/Q/9I/1Q/VD9UP1krSAChoQhCSABQRBqIgFBwABJDQALIAYgByAIIAkLyAMCAn8QfiADIQQgAEEBca0hDCAAQQF2QQFxrSENIABBAnatIQ4CQANAIAEgAk8NASACIAFrIQUgBUHAAE8EQEHAACEFQn8hBwVCASAFrYZCAX0hBwsgBUEBa60hBiABEAAhCyEKIQkhCCAJIAeDIQkgCSAJQgGGQn+FgyEPQtWq1arVqtWq1QAgDYUhECAJIA8gEEJ/hYN8IREgCUJ/hSAJIA8gEIN8QqrVqtWq1arVqn+DIBEgDYRC1arVqtWq1arVAIOEgyESIBEgCVStIBIgBa2IQgGDIAVBwABGGyENIAggB4MgEkJ/hYMhCCAIIRMgEyATQgGGhSETIBMgE0IChoUhEyATIBNCBIaFIRMgEyATQgiGhSETIBMgE0IQhoUhEyATIBNCIIaFIRMgE0IAIAx9hSETIBMgBohCAYMhDCAHIAggC4QgE4RCf4WDIRQgCCAKIAeDIBNCf4WDhCAUIBRCAYYgDoRCf4WDhCEVIBQgBohCAYMhDgJAA0AgFVANASADIAEgFXqnajYCACADQQRqIQMgFSAVQgF9gyEVDAALCyABQcAAaiEBDAALCyADIARrQQF0IAwgDUIBhoQgDkIChoSncgtxAwF/AXsCfwJAA0AgACABTw0BIAD9AAQAIQMgASAAayEFQf//A0EBIAV0QQFrIAVBEE8bIQQgAiAEQX8gA0HAAf0P/U5BgAH9D/0j/WRzcWkgBCADQfAB/Q/9LP1kcWlqaiECIABBEGohAAwACwsgAgs=';
+const TOKENIZER = 'AGFzbQEAAAABGANgAX8Ffn5+fn5gBH9/f38Bf2ACf38BfwIPAQNlbnYGbWVtb3J5AgABAwQDAAECBxoCCHRva2VuaXplAAELdXRmMTZMZW5ndGgAAgq6BwPkAQQBfwF+A3sFfgNAIAAgAWr9AAQAIQMgA0Eg/Q/9UCEEIANBLP0P/SMgA0E6/Q/9I/1QIARB+wD9D/0jIARB/QD9D/0j/VD9UCEFIAGtIQIgBiADQSL9D/0j/WStIAKGhCEGIAcgA0HcAP0P/SP9ZK0gAoaEIQcgCiADQSD9D/0m/WStIAKGhCEKIAggBf1krSAChoQhCCAJIAUgA0Eg/Q/9IyADQQn9D/0j/VAgA0EK/Q/9IyADQQ39D/0j/VD9UP1Q/WStIAKGhCEJIAFBEGoiAUHAAEkNAAsgBiAHIAggCSAKC98EAwJ/FH4BfyADIQQgAEEBca0hDCAAQQF2QQFxrSENIABBAnZBAXGtIQ4gAEEDdq0hFwJAA0AgASACTw0BIAIgAWshBSAFQcAATwRAQcAAIQVCfyEHBUIBIAWthkIBfSEHCyAFQQFrrSEGIAEQACEWIQshCiEJIQggCSAHgyEJIBYgCYQgB4MhFiAJIAlCAYZCf4WDIQ9C1arVqtWq1arVACANhSEQIAkgDyAQQn+Fg3whESAJQn+FIAkgDyAQg3xCqtWq1arVqtWqf4MgESANhELVqtWq1arVqtUAg4SDIRIgESAJVK0gEiAFrYhCAYMgBUHAAEYbIQ0gCCAHgyASQn+FgyEIIAghEyATIBNCAYaFIRMgEyATQgKGhSETIBMgE0IEhoUhEyATIBNCCIaFIRMgEyATQhCGhSETIBMgE0IghoUhEyATQgAgDH2FIRMgEyAGiEIBgyEMIAcgCCALhCAThEJ/hYMhFCAIIAogB4MgE0J/hYOEIBQgFEIBhiAOhEJ/hYOEIRUgFCAGiEIBgyEOQgAhGAJAA0AgFVANASAVeiEZQQAhGiAIIBmIQgGDpwRAIBMgGYhCAYOnBEBCACEXIBlCAXwhGAUgF6dCACAWQgEgGYZCAX1CASAYhkIBfUJ/hYODUnIhGkIAIRcLCyADIAEgGadqIBpBH3RyNgIAIANBBGohAyAVIBVCAX2DIRUMAAsLIAynIBhCwABUcQRAIBdCACAWIBiIUq2EIRcLIAFBwABqIQEMAAsLIAMgBGtBAnQgDCANQgGGhCAOQgKGIBcgDINCA4aEhKdyC3EDAX8BewJ/AkADQCAAIAFPDQEgAP0ABAAhAyABIABrIQVB//8DQQEgBXRBAWsgBUEQTxshBCACIARBfyADQcAB/Q/9TkGAAf0P/SP9ZHNxaSAEIANB8AH9D/0s/WRxaWpqIQIgAEEQaiEADAALCyACCw==';
 
 const tokenizerModule = new WebAssembly.Module(Uint8Array.from(atob(TOKENIZER), c => c.charCodeAt(0)));
 
@@ -486,10 +489,11 @@ class Value implements JsonStValue {
         const c = peek(input);
         if (c === MORE && input.mark === input.len) return more(input).then(step);
         closed = c !== MORE;
-        const end = closed ? input.tokens[input.cursor]! : input.len;
+        const token = closed ? input.tokens[input.cursor]! : input.len;
+        const end = token & ADDRESS;
         if (closed && partial === undefined) {
           // The whole string arrived at once.
-          const text = decodeString(input.bytes, input.mark, end);
+          const text = decodeString(input.bytes, input.mark, end, token >= SPECIAL);
           input.cursor++;
           input.mark = NONE;
           this.#state = DONE;
@@ -680,7 +684,10 @@ function typeName(first: number): string {
   return TYPE_NAMES[first] ?? 'number, boolean, or null';
 }
 
-/** Decodes the escapes in the raw contents of a string, which must be complete. */
+/**
+ * Decodes the escapes in raw contents of a string with complete escapes.
+ * Used for pieces of a string whose closing quote hasn't been tokenized yet.
+ */
 function unescape(raw: string): string {
   // Most strings have nothing to decode or reject.
   return /[\\\u0000-\u001f]/.test(raw) ? JSON.parse('"' + raw + '"') : raw;
