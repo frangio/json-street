@@ -334,6 +334,20 @@ test('a skipped value can not be resumed', async () => {
   await assert.rejects(second.parse(), /already consumed/);
 });
 
+test('iterators and handles left behind are rejected', async () => {
+  const docs = parseValues(stream('[[1,', '2],3] {"a":1,"b":2}'))[Symbol.asyncIterator]();
+  const outer = (await docs.next()).value!.arrayValues()[Symbol.asyncIterator]();
+  const inner = (await outer.next()).value!.arrayValues()[Symbol.asyncIterator]();
+  assert.equal(await (await inner.next()).value!.parse(), 1);
+  assert.equal(await (await outer.next()).value!.parse(), 3);
+  await assert.rejects(inner.next(), /skipped/);
+  let previous: JsonStValue | undefined;
+  for await (const [, value] of (await docs.next()).value!.objectEntries()) {
+    if (previous) await assert.rejects(previous.parse(), /already consumed/);
+    previous = value;
+  }
+});
+
 test('parse may be awaited after advancing', async () => {
   const promises = [];
   for await (const value of parseValues(stream('[{"a":', '1},2,', '"x"]'))) {
@@ -365,6 +379,8 @@ test('syntax errors', async () => {
     await assert.rejects(readAll([text], read), SyntaxError, text);
     await assert.rejects(readAll([text], v => v.parse()), SyntaxError, text);
   }
+  // A member's value is checked even when it is skipped.
+  await assert.rejects(readAll(['{"a":}}'], v => collect(v.objectEntries())), SyntaxError);
 });
 
 test('stops reading the stream when iteration stops', async () => {

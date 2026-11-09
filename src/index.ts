@@ -23,22 +23,12 @@ export interface JsonStValue {
  * bytes or text. Chunks may be split anywhere, even inside a character.
  */
 export function parseValues(stream: AsyncIterable<Uint8Array | string>): AsyncIterable<JsonStValue> {
-  const input = createInput(stream[Symbol.asyncIterator]());
-  let value: Value | undefined;
-  const step = (): Step<Value> => {
-    const finished = value?.finish();
-    if (finished) return finished.then(step);
-    const c = peek(input);
-    if (c === MORE) return more(input).then(step);
-    if (c === EOF) return undefined;
-    return value = new Value(input);
-  };
-  return new Items(step, async () => {
-    // The consumer may stop iterating while a parse is in progress, as in
-    // `for await (const v of parseValues(s)) return v.parse();`
-    await value?.parsed();
-    await input.w.source.return?.();
-  });
+  const p = createParser(stream[Symbol.asyncIterator]());
+  return new Items(() => {
+    const seq = next(p, ROOT, ROOT);
+    if (seq instanceof Promise) return seq.then(seq => seq === undefined ? undefined : new Value(p, seq, 0));
+    return seq === undefined ? undefined : new Value(p, seq, 0);
+  }, () => close(p));
 }
 
 /**
@@ -521,14 +511,260 @@ function exitContainer(input: Input, depth: number): number | Promise<number> {
   }
 }
 
+// PARSER /////////////////////////////////////////////////////////////////////
+
+// The parser navigates the tree of values in stream order. Values are named by
+// sequence numbers, issued in stream order as `next` reaches them; values
+// skipped inside a skipped value get none. The value of an object member is
+// numbered after its key, and is reached by an operation on it, which skips
+// the key if needed. A value is consumed by one operation, and moving on
+// skips whatever part of it was not consumed.
+//
+// Operations return a plain result, or a promise only when they must wait for
+// input. An operation waiting for input holds the parser, and later ones run
+// after it.
+
+/** The parent of the top-level values, at depth -1. */
+const ROOT = -1;
+
+// States of the current value.
+/** Reached, but nothing of it consumed. */
+const START = 0;
+/** A string entered by `enter`, read up to the pin. */
+const STRING = 1;
+/** A container entered by `enter`, with no child reached yet. */
+const OPENED = 2;
+/** Consumed, and the separator after it not yet. */
+const DONE = 3;
+/** Consumed, and the comma after it too. */
+const AFTER_COMMA = 4;
+/** An object key consumed, and the colon after it too. */
+const AFTER_COLON = 5;
+
+type Parser = {
+  input: Input;
+  /** The current value: the one reached last, or the container entered last. */
+  current: number;
+  state: number;
+  /** Whether the current value is an object key. */
+  key: boolean;
+  /** The last sequence number issued or reserved for a member's value. */
+  last: number;
+  /** The entered containers that are still open, and their opening bytes. */
+  open: number[];
+  kinds: number[];
+  /** Decodes UTF-8 across pieces, once the entered string spans several. */
+  partial: TextDecoder | undefined;
+  /** An incomplete escape sequence at the end of the last piece. */
+  held: string;
+  /** Settles when the operation waiting for input, if any, is done. */
+  waiting: Promise<void> | undefined;
+};
+
+function createParser(source: AsyncIterator<Uint8Array | string>): Parser {
+  return {
+    input: createInput(source), current: ROOT, state: OPENED, key: false, last: ROOT,
+    open: [], kinds: [], partial: undefined, held: '', waiting: undefined,
+  };
+}
+
 /**
- * Consumes the value that starts at the next token, returning it parsed.
- * Returns a promise if it has to wait for input.
+ * Returns the next child of the entered container `parent` at `depth`, or
+ * undefined after its last child.
  */
-function parseValue(input: Input): unknown {
+function next(p: Parser, parent: number, depth: number): Step<number> {
+  if (p.waiting !== undefined) return p.waiting.then(() => next(p, parent, depth));
+  return hold(p, advance(p, parent, depth));
+}
+
+/** Enters value `seq`, which must start with `kind`: QUOTE, LBRACKET, or LBRACE. */
+function enter(p: Parser, seq: number, kind: number): void | Promise<void> {
+  if (p.waiting !== undefined) return p.waiting.then(() => enter(p, seq, kind));
+  return hold(p, enterNow(p, seq, kind));
+}
+
+/** Parses value `seq` whole. */
+function parse(p: Parser, seq: number): unknown {
+  if (p.waiting !== undefined) return p.waiting.then(() => parse(p, seq));
+  return hold(p, parseNow(p, seq));
+}
+
+/**
+ * Returns the next decoded piece of the entered string `seq`, or undefined
+ * after the last one.
+ */
+function chunk(p: Parser, seq: number): Step<string> {
+  if (p.waiting !== undefined) return p.waiting.then(() => chunk(p, seq));
+  return hold(p, chunkNow(p, seq));
+}
+
+/** Waits for an operation in progress, then releases the source. */
+async function close(p: Parser): Promise<void> {
+  await p.waiting;
+  await p.input.w.source.return?.();
+}
+
+/** Makes later operations wait for `result` if it is a promise. */
+function hold<T>(p: Parser, result: T): T {
+  if (result instanceof Promise) {
+    const release = () => {
+      if (p.waiting === waiting) p.waiting = undefined;
+    };
+    const waiting: Promise<void> = result.then(release, release);
+    p.waiting = waiting;
+  }
+  return result;
+}
+
+// Each step below either completes and updates the state, or returns a
+// promise that continues it from where it stopped.
+
+function advance(p: Parser, parent: number, depth: number): Step<number> {
+  const { input } = p;
+  if (depth !== ROOT && p.open[depth] !== parent) {
+    throw new Error('JSON value skipped before it was consumed');
+  }
+  // Skips the rest of containers entered inside the current child.
+  while (p.open.length > depth + 1) {
+    input.w.pin = NONE;
+    const end = exitContainer(input, 1);
+    if (typeof end !== 'number') {
+      return end.then(() => {
+        closeContainer(p);
+        return advance(p, parent, depth);
+      });
+    }
+    closeContainer(p);
+  }
+  if (p.key) {
+    const reached = toValue(p);
+    if (reached) return reached.then(() => advance(p, parent, depth));
+  }
+  if (p.state === START || p.state === STRING) {
+    const end = finishValue(p);
+    if (typeof end !== 'number') return end.then(() => advance(p, parent, depth));
+  }
+  const c = peek(input);
+  if (c === MORE) return more(input).then(() => advance(p, parent, depth));
+  const kind = depth === ROOT ? ROOT : p.kinds[depth]!;
+  if (kind === ROOT) {
+    if (c === EOF) return undefined;
+  } else {
+    if (c === (kind === LBRACKET ? RBRACKET : RBRACE) && p.state !== AFTER_COMMA) {
+      input.cursor++;
+      closeContainer(p);
+      return undefined;
+    }
+    if (p.state === DONE) {
+      if (c !== COMMA) throw unexpected(c);
+      input.cursor++;
+      p.state = AFTER_COMMA;
+      return advance(p, parent, depth);
+    }
+  }
+  if (kind === LBRACE) {
+    if (c !== QUOTE) throw unexpected(c);
+    p.key = true;
+    p.current = ++p.last;
+    p.last++;
+  } else {
+    checkStart(c);
+    p.current = ++p.last;
+  }
+  p.state = START;
+  return p.current;
+}
+
+/** Consumes the rest of the current value, which is at START or STRING. */
+function finishValue(p: Parser): number | Promise<number> {
+  const { input } = p;
+  let end;
+  if (p.state === START) {
+    end = consumeValue(input);
+  } else {
+    input.w.pin = NONE;
+    end = exitString(input);
+  }
+  if (typeof end !== 'number') {
+    return end.then(end => {
+      p.state = DONE;
+      return end;
+    });
+  }
+  p.state = DONE;
+  return end;
+}
+
+/** Makes the innermost open container the current value, consumed. */
+function closeContainer(p: Parser): void {
+  p.current = p.open.pop()!;
+  p.kinds.pop();
+  p.state = DONE;
+  p.key = false;
+}
+
+/** Moves from the current value, a key, to the start of its member's value. */
+function toValue(p: Parser): Promise<void> | undefined {
+  const { input } = p;
+  if (p.state === START || p.state === STRING) {
+    const end = finishValue(p);
+    if (typeof end !== 'number') return end.then(() => toValue(p));
+  }
+  if (p.state === DONE) {
+    const c = peek(input);
+    if (c === MORE) return more(input).then(() => toValue(p));
+    if (c !== COLON) throw unexpected(c);
+    input.cursor++;
+    p.state = AFTER_COLON;
+  }
+  const c = peek(input);
+  if (c === MORE) return more(input).then(() => toValue(p));
+  checkStart(c);
+  p.current++;
+  p.key = false;
+  p.state = START;
+}
+
+function checkStart(c: number): void {
+  if (c === EOF || c === COMMA || c === COLON || c === RBRACKET || c === RBRACE) throw unexpected(c);
+}
+
+/** Makes value `seq` current, if it is the current key's, and checks that it is at START. */
+function claim(p: Parser, seq: number): Promise<void> | undefined {
+  if (p.key && seq === p.current + 1) {
+    const reached = toValue(p);
+    if (reached) return reached;
+  }
+  if (p.current !== seq || p.state !== START) throw new Error('JSON value already consumed');
+}
+
+function enterNow(p: Parser, seq: number, kind: number): void | Promise<void> {
+  const claimed = claim(p, seq);
+  if (claimed) return claimed.then(() => enterNow(p, seq, kind));
+  const { input } = p;
+  // A value at START has its first token buffered.
+  const c = peek(input);
+  if (c !== kind) throw new TypeError(`Expected JSON ${TYPE_NAMES[kind]}, found ${typeName(c)}`);
+  const i = input.cursor++;
+  if (kind === QUOTE) {
+    input.w.pin = token(input, i) + 1;
+    p.partial = undefined;
+    p.held = '';
+    p.state = STRING;
+  } else {
+    p.open.push(seq);
+    p.kinds.push(kind);
+    p.state = OPENED;
+  }
+}
+
+function parseNow(p: Parser, seq: number): unknown {
+  const claimed = claim(p, seq);
+  if (claimed) return claimed.then(() => parseNow(p, seq));
+  const { input } = p;
   const kind = peek(input);
   input.w.pin = token(input, input.cursor);
-  const end = consumeValue(input);
+  const end = finishValue(p);
   return typeof end === 'number' ? parseConsumed(input, kind, end) : end.then(end => parseConsumed(input, kind, end));
 }
 
@@ -551,248 +787,97 @@ function decodeString(raw: string, special: boolean): string {
   return special ? JSON.parse('"' + raw + '"') : raw;
 }
 
+function chunkNow(p: Parser, seq: number): Step<string> {
+  if (p.current !== seq || p.state !== STRING) {
+    throw new Error('JSON value skipped before it was consumed');
+  }
+  const { input } = p;
+  const { w } = input;
+  for (;;) {
+    // The contents not read yet start at the pin. The next token is the
+    // closing quote, if it has arrived.
+    const c = peek(input);
+    if (c === MORE && w.pin === w.end) return more(input).then(() => chunkNow(p, seq));
+    const closed = c !== MORE;
+    const end = closed ? token(input, input.cursor) : w.end;
+    let piece;
+    if (closed && p.partial === undefined) {
+      // The rest of the string arrived at once.
+      piece = decodeString(text(w, w.pin, end), special(input, input.cursor));
+    } else {
+      p.partial ??= new TextDecoder('utf-8', { ignoreBOM: true });
+      const raw = p.held + p.partial.decode(input.bytes.subarray(w.pin - w.origin, end - w.origin), { stream: !closed });
+      const complete = closed ? raw.length : completeEscapesEnd(raw);
+      p.held = raw.slice(complete);
+      piece = complete > 0 ? unescape(raw.slice(0, complete)) : '';
+    }
+    w.pin = end;
+    if (piece.length > 0) return piece;
+    if (closed) {
+      // The closing quote is consumed only after the last piece, so that the
+      // string ends in a call of its own.
+      input.cursor++;
+      w.pin = NONE;
+      p.state = DONE;
+      return undefined;
+    }
+  }
+}
+
 // VALUES /////////////////////////////////////////////////////////////////////
 
-const PENDING = 0, ACTIVE = 1, DONE = 2;
-
 class Value implements JsonStValue {
-  #input: Input;
-  /** The key of an object member, which precedes this value in the stream. */
-  #key: Value | undefined;
-  #state = PENDING;
-  /** The kind of the first token of the value, once known. */
-  #first = EOF;
-  /** Whether a string, array, or object has been entered. */
-  #entered = false;
-  /** The element last yielded while iterating an array or object. */
-  #child: Value | undefined;
-  /** The parse in progress, while it waits for input. */
-  #capture: Promise<unknown> | undefined;
+  #p: Parser;
+  #seq: number;
+  #depth: number;
 
-  constructor(input: Input, key?: Value) {
-    this.#input = input;
-    this.#key = key;
+  constructor(p: Parser, seq: number, depth: number) {
+    this.#p = p;
+    this.#seq = seq;
+    this.#depth = depth;
   }
 
   async parse(): Promise<unknown> {
-    this.#claim();
-    const started = this.#start();
-    let value = started ? started.then(() => parseValue(this.#input)) : parseValue(this.#input);
-    if (value instanceof Promise) {
-      this.#capture = value;
-      value = await value;
-    }
-    this.#state = DONE;
-    return value;
+    return parse(this.#p, this.#seq);
   }
 
   stringChunks(): AsyncIterable<string> {
-    const input = this.#input;
+    const p = this.#p, seq = this.#seq;
     let entered = false;
-    let closed = false;
-    /** Decodes UTF-8 across segments, once the string spans several. */
-    let partial: TextDecoder | undefined;
-    /** An incomplete escape sequence at the end of the last segment. */
-    let held = '';
-    const step = (): Step<string> => {
+    return new Items(() => {
       if (!entered) {
         entered = true;
-        const started = this.#enter(QUOTE);
-        if (started) return started.then(step);
+        const started = enter(p, seq, QUOTE);
+        if (started) return started.then(() => chunk(p, seq));
       }
-      if (closed) return undefined;
-      this.#checkActive();
-      for (;;) {
-        // The contents start at the mark. The next token is the closing
-        // quote, if it has arrived.
-        const c = peek(input);
-        if (c === MORE && input.w.pin === input.w.end) return more(input).then(step);
-        closed = c !== MORE;
-        const end = closed ? token(input, input.cursor) : input.w.end;
-        if (closed && partial === undefined) {
-          // The whole string arrived at once.
-          const s = decodeString(text(input.w, input.w.pin, end), special(input, input.cursor));
-          input.cursor++;
-          input.w.pin = NONE;
-          this.#state = DONE;
-          return s.length > 0 ? s : undefined;
-        }
-        partial ??= new TextDecoder('utf-8', { ignoreBOM: true });
-        let raw = held + partial.decode(input.bytes.subarray(input.w.pin - input.w.origin, end - input.w.origin), { stream: !closed });
-        held = '';
-        if (closed) {
-          input.cursor++;
-          input.w.pin = NONE;
-          this.#state = DONE;
-        } else {
-          input.w.pin = end;
-          const complete = completeEscapesEnd(raw);
-          held = raw.slice(complete);
-          raw = raw.slice(0, complete);
-        }
-        if (raw.length > 0) return unescape(raw);
-        if (closed) return undefined;
-      }
-    };
-    return new Items(step);
+      return chunk(p, seq);
+    });
   }
 
   arrayValues(): AsyncIterable<JsonStValue> {
-    const input = this.#input;
-    let entered = false;
-    let child: Value | undefined;
-    const step = (): Step<Value> => {
-      if (!entered) {
-        entered = true;
-        const started = this.#enter(LBRACKET);
-        if (started) return started.then(step);
-      }
-      this.#checkActive();
-      const finished = child?.finish();
-      if (finished) return finished.then(step);
-      const c = peek(input);
-      if (c === MORE) return more(input).then(step);
-      if (c === RBRACKET) {
-        input.cursor++;
-        this.#state = DONE;
-        return undefined;
-      }
-      if (child !== undefined) {
-        if (c !== COMMA) throw unexpected(c);
-        input.cursor++;
-      }
-      return child = this.#child = new Value(input);
-    };
-    return new Items(step);
+    const p = this.#p, depth = this.#depth + 1;
+    return this.#children(LBRACKET, seq => new Value(p, seq, depth));
   }
 
   objectEntries(): AsyncIterable<[key: JsonStValue, value: JsonStValue]> {
-    const input = this.#input;
+    const p = this.#p, depth = this.#depth + 1;
+    return this.#children(LBRACE, seq => [new Value(p, seq, depth), new Value(p, seq + 1, depth)]);
+  }
+
+  #children<T>(kind: number, item: (seq: number) => T): AsyncIterable<T> {
+    const p = this.#p, seq = this.#seq, depth = this.#depth;
     let entered = false;
-    let value: Value | undefined;
-    let afterComma = false;
-    const step = (): Step<[Value, Value]> => {
+    const step = (): Step<T> => {
       if (!entered) {
         entered = true;
-        const started = this.#enter(LBRACE);
+        const started = enter(p, seq, kind);
         if (started) return started.then(step);
       }
-      this.#checkActive();
-      if (value !== undefined) {
-        const finished = value.finish();
-        if (finished) return finished.then(step);
-        const c = peek(input);
-        if (c === MORE) return more(input).then(step);
-        if (c === COMMA) {
-          input.cursor++;
-          value = undefined;
-          afterComma = true;
-        } else if (c !== RBRACE) {
-          throw unexpected(c);
-        }
-      }
-      const c = peek(input);
-      if (c === MORE) return more(input).then(step);
-      if (c === RBRACE && !afterComma) {
-        input.cursor++;
-        this.#state = DONE;
-        return undefined;
-      }
-      if (c !== QUOTE) throw unexpected(c);
-      afterComma = false;
-      const key = new Value(input);
-      value = this.#child = new Value(input, key);
-      return [key, value];
+      const child = next(p, seq, depth);
+      if (child instanceof Promise) return child.then(child => child === undefined ? undefined : item(child));
+      return child === undefined ? undefined : item(child);
     };
     return new Items(step);
-  }
-
-  /**
-   * Consumes whatever part of the value has not been consumed yet. Returns a
-   * promise if it has to wait for input.
-   */
-  finish(): Promise<unknown> | undefined {
-    const state = this.#state;
-    if (state === DONE) return;
-    this.#state = DONE;
-    const input = this.#input;
-    let result: number | Promise<unknown> | undefined;
-    if (this.#capture !== undefined) {
-      result = this.parsed();
-    } else if (!this.#entered) {
-      // Nothing has been consumed yet (an iterator may be about to start).
-      const started = this.#start();
-      result = started ? started.then(() => consumeValue(input)) : consumeValue(input);
-    } else if (this.#first === QUOTE) {
-      input.w.pin = NONE;
-      result = exitString(input);
-    } else {
-      const finished = this.#child?.finish();
-      result = finished ? finished.then(() => exitContainer(input, 1)) : exitContainer(input, 1);
-    }
-    return typeof result === 'number' ? undefined : result;
-  }
-
-  /** Waits until a parse in progress, if any, has consumed its input. */
-  async parsed(): Promise<void> {
-    await this.#capture?.catch(() => {});
-  }
-
-  #claim(): void {
-    if (this.#state !== PENDING) throw new Error('JSON value already consumed');
-    this.#state = ACTIVE;
-  }
-
-  #checkActive(): void {
-    if (this.#state !== ACTIVE) throw new Error('JSON value skipped before it was consumed');
-  }
-
-  /**
-   * Moves the input to the first token of the value. Returns a promise if
-   * it has to wait for input.
-   */
-  #start(): Promise<void> | undefined {
-    if (this.#first !== EOF) return;
-    const input = this.#input;
-    const key = this.#key;
-    if (key !== undefined) {
-      const finished = key.finish();
-      if (finished) return finished.then(() => this.#start());
-      const c = peek(input);
-      if (c === MORE) return more(input).then(() => this.#start());
-      if (c !== COLON) throw unexpected(c);
-      input.cursor++;
-      this.#key = undefined;
-    }
-    const c = peek(input);
-    if (c === MORE) return more(input).then(() => this.#start());
-    if (c === EOF || c === COMMA || c === COLON || c === RBRACKET || c === RBRACE) {
-      throw unexpected(c);
-    }
-    this.#first = c;
-  }
-
-  /**
-   * Enters the value, which must start with `open`. Returns a promise if it
-   * has to wait for input.
-   */
-  #enter(open: number): Promise<void> | undefined {
-    this.#claim();
-    const started = this.#start();
-    if (started) return started.then(() => this.#enterStarted(open));
-    this.#enterStarted(open);
-  }
-
-  #enterStarted(open: number): void {
-    if (this.#first !== open) {
-      this.#state = PENDING;
-      throw new TypeError(`Expected JSON ${TYPE_NAMES[open]}, found ${typeName(this.#first)}`);
-    }
-    const input = this.#input;
-    // For strings, the mark is where the contents start.
-    if (open === QUOTE) input.w.pin = token(input, input.cursor) + 1;
-    input.cursor++;
-    this.#entered = true;
   }
 }
 
