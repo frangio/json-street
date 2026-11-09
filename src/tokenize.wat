@@ -88,9 +88,9 @@
     (local $inString i64) (local $escaped i64) (local $inScalar i64)
     (local $starts i64) (local $even i64) (local $oddCarries i64) (local $escapes i64)
     (local $inside i64) (local $scalar i64) (local $tokens i64)
-    ;; Control characters or backslashes in strings, whether the open string
-    ;; has had one, the position after the last opening quote, and a token.
-    (local $specials i64) (local $special i64) (local $runStart i64) (local $bit i64) (local $flag i32)
+    ;; Control characters or backslashes, whether the open string has had
+    ;; one, closing quotes of strings that had one, and a token.
+    (local $specials i64) (local $special i64) (local $flagged i64) (local $bit i64)
     ;; Opening and closing brackets outside strings, the index of the first
     ;; token of the block, and the tokens of the block.
     (local $open i64) (local $close i64) (local $index i32) (local $blockTokens i64) (local $at i32)
@@ -167,6 +167,16 @@
         (local.set $inside (i64.xor (local.get $inside) (i64.sub (i64.const 0) (local.get $inString))))
         (local.set $inString (i64.and (i64.shr_u (local.get $inside) (local.get $last)) (i64.const 1)))
 
+        ;; Strings contain no quotes, so subtracting the special characters in
+        ;; strings from the quotes borrows from each special character up to
+        ;; the closing quote of its string, which the XOR then picks out. A
+        ;; string open from the previous block with one counts it at bit 0.
+        ;; A borrow out of the block means the open string has had one.
+        (local.set $specials (i64.or (i64.and (local.get $specials) (local.get $inside)) (local.get $special)))
+        (local.set $flagged (i64.and (local.get $quote)
+          (i64.xor (local.get $quote) (i64.sub (local.get $quote) (local.get $specials)))))
+        (local.set $special (i64.extend_i32_u (i64.gt_u (local.get $specials) (local.get $quote))))
+
         ;; Scalars are runs of other bytes outside strings.
         (local.set $scalar (i64.and (local.get $valid)
           (i64.xor (i64.or (i64.or (local.get $quote) (local.get $delim)) (local.get $inside)) (i64.const -1))))
@@ -184,34 +194,14 @@
 
         (local.set $blockTokens (local.get $tokens))
         (local.set $index (i32.shr_u (i32.sub (local.get $out) (local.get $first)) (i32.const 2)))
-        ;; A string open from an earlier block runs from the block's start.
-        (local.set $runStart (i64.const 0))
         (block $written
           (loop $write
             (br_if $written (i64.eqz (local.get $tokens)))
             (local.set $bit (i64.ctz (local.get $tokens)))
-            (local.set $flag (i32.const 0))
-            (if (i32.wrap_i64 (i64.and (i64.shr_u (local.get $quote) (local.get $bit)) (i64.const 1)))
-              (then
-                (if (i32.wrap_i64 (i64.and (i64.shr_u (local.get $inside) (local.get $bit)) (i64.const 1)))
-                  (then
-                    ;; An opening quote.
-                    (local.set $special (i64.const 0))
-                    (local.set $runStart (i64.add (local.get $bit) (i64.const 1))))
-                  (else
-                    ;; A closing quote, flagged if the string had a special
-                    ;; character in this block, from $runStart to $bit, or before.
-                    (local.set $flag (i32.or
-                      (i32.wrap_i64 (local.get $special))
-                      (i64.ne (i64.const 0) (i64.and (local.get $specials)
-                        (i64.and
-                          (i64.sub (i64.shl (i64.const 1) (local.get $bit)) (i64.const 1))
-                          (i64.xor (i64.sub (i64.shl (i64.const 1) (local.get $runStart)) (i64.const 1)) (i64.const -1)))))))
-                    (local.set $special (i64.const 0))))))
             (i32.store (local.get $out)
               (i32.or
                 (i32.add (local.get $pos) (i32.wrap_i64 (local.get $bit)))
-                (i32.shl (local.get $flag) (i32.const 31))))
+                (i32.shl (i32.wrap_i64 (i64.shr_u (local.get $flagged) (local.get $bit))) (i32.const 31))))
             (local.set $out (i32.add (local.get $out) (i32.const 4)))
             (local.set $tokens (i64.and (local.get $tokens)
               (i64.sub (local.get $tokens) (i64.const 1))))
@@ -254,12 +244,6 @@
                 (global.set $depth (i32.add (global.get $depth) (i32.const 1)))))
             (local.set $open (i64.and (local.get $open) (i64.sub (local.get $open) (i64.const 1))))
             (br $match)))
-
-        ;; A string still open carries whether it had a special character.
-        (if (i32.and (i32.wrap_i64 (local.get $inString)) (i64.lt_u (local.get $runStart) (i64.const 64)))
-          (then (local.set $special (i64.or (local.get $special)
-            (i64.extend_i32_u (i64.ne (i64.const 0)
-              (i64.shr_u (local.get $specials) (local.get $runStart))))))))
 
         (local.set $pos (i32.add (local.get $pos) (i32.const 64)))
         (br $blocks)))
