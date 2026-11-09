@@ -18,18 +18,19 @@
 ;; opened in, the index of its token is written as a 16-bit word at $LINKS +
 ;; 2 × the index of the opening bracket's token. Every other opening bracket gets 0 there.
 ;; Open brackets are kept on a stack at $STACK, of at most $CAP entries, which
-;; persists across calls. Entries from earlier calls are not linked, since
-;; their tokens are gone.
+;; starts empty in each call: a bracket that closes in a later call is never
+;; linked, so the stack needn't persist, and a closing bracket that arrives
+;; with the stack empty is ignored.
+;;
+;; Positions are relative to the byte region at $BYTES, and the result depends
+;; only on the arguments and the bytes.
 (module
   (import "env" "memory" (memory 1))
 
   (global $LINKS i32 (i32.const 32768))
   (global $STACK i32 (i32.const 65536))
   (global $CAP i32 (i32.const 16384))
-  ;; The number of open brackets, and the depth below which entries of the
-  ;; stack come from earlier calls.
-  (global $depth (mut i32) (i32.const 0))
-  (global $floor (mut i32) (i32.const 0))
+  (global $BYTES i32 (i32.const 98304))
 
   ;; Returns bitmasks of the 64 bytes at $p: quotes, backslashes, opening
   ;; brackets, closing brackets, brackets and commas and colons, those or
@@ -96,8 +97,11 @@
     ;; Opening and closing brackets outside strings, the index of the first
     ;; token of the block, and the tokens of the block.
     (local $open i64) (local $close i64) (local $index i32) (local $blockTokens i64) (local $at i32)
+    ;; The number of open brackets in this call.
+    (local $depth i32)
+    (local.set $pos (i32.add (local.get $pos) (global.get $BYTES)))
+    (local.set $end (i32.add (local.get $end) (global.get $BYTES)))
     (local.set $base (local.get $pos))
-    (global.set $floor (global.get $depth))
     (local.set $inString (i64.extend_i32_u (i32.and (local.get $state) (i32.const 1))))
     (local.set $escaped (i64.extend_i32_u (i32.and (i32.shr_u (local.get $state) (i32.const 1)) (i32.const 1))))
     (local.set $inScalar (i64.extend_i32_u (i32.and (i32.shr_u (local.get $state) (i32.const 2)) (i32.const 1))))
@@ -224,26 +228,22 @@
             (if (i32.wrap_i64 (i64.and (i64.shr_u (local.get $close) (local.get $bit)) (i64.const 1)))
               (then
                 ;; Unbalanced closing brackets are left for the parser to reject.
-                (if (global.get $depth)
+                (if (local.get $depth)
                   (then
-                    (global.set $depth (i32.sub (global.get $depth) (i32.const 1)))
-                    (if (i32.and
-                          (i32.ge_u (global.get $depth) (global.get $floor))
-                          (i32.lt_u (global.get $depth) (global.get $CAP)))
+                    (local.set $depth (i32.sub (local.get $depth) (i32.const 1)))
+                    (if (i32.lt_u (local.get $depth) (global.get $CAP))
                       (then (i32.store16
                         (i32.add (global.get $LINKS) (i32.shl
-                          (i32.load16_u (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 1))))
+                          (i32.load16_u (i32.add (global.get $STACK) (i32.shl (local.get $depth) (i32.const 1))))
                           (i32.const 1)))
-                        (local.get $at))))
-                    (if (i32.lt_u (global.get $depth) (global.get $floor))
-                      (then (global.set $floor (global.get $depth)))))))
+                        (local.get $at)))))))
               (else
                 (i32.store16 (i32.add (global.get $LINKS) (i32.shl (local.get $at) (i32.const 1))) (i32.const 0))
-                (if (i32.lt_u (global.get $depth) (global.get $CAP))
+                (if (i32.lt_u (local.get $depth) (global.get $CAP))
                   (then (i32.store16
-                    (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 1)))
+                    (i32.add (global.get $STACK) (i32.shl (local.get $depth) (i32.const 1)))
                     (local.get $at))))
-                (global.set $depth (i32.add (global.get $depth) (i32.const 1)))))
+                (local.set $depth (i32.add (local.get $depth) (i32.const 1)))))
             (local.set $open (i64.and (local.get $open) (i64.sub (local.get $open) (i64.const 1))))
             (br $match)))
 
@@ -261,6 +261,8 @@
   ;; character. Reads up to 15 bytes past `end`.
   (func (export "utf16Length") (param $pos i32) (param $end i32) (result i32)
     (local $n i32) (local $v v128) (local $valid i32) (local $left i32)
+    (local.set $pos (i32.add (local.get $pos) (global.get $BYTES)))
+    (local.set $end (i32.add (local.get $end) (global.get $BYTES)))
     (block $done
       (loop $parts
         (br_if $done (i32.ge_u (local.get $pos) (local.get $end)))

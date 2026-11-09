@@ -117,9 +117,9 @@ const encoder = new TextEncoder();
 // Keeps a leading U+FEFF, which would otherwise be dropped from string contents.
 const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 
-// INPUT //////////////////////////////////////////////////////////////////////
+// TOKENIZER //////////////////////////////////////////////////////////////////
 
-// The stream is buffered as bytes in memory and tokenized in one pass. A token
+// The stream is tokenized in one pass, in slices. A token
 // locates a byte that starts something: a bracket, comma, or colon, either
 // quote of a string, or the first byte of a number, boolean, or null. The kind
 // of a token is the byte it points to. A number, boolean, or null ends at the
@@ -127,39 +127,69 @@ const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 // SPECIAL bit set if the string has a backslash or a control character, so it
 // must be unescaped or rejected rather than just decoded.
 //
-// Tokens are stored as 16-bit offsets from Input.base, with the special bit at
-// bit 15, and read as addresses with the special bit at bit 31 (see token).
+// Tokens are stored as 16-bit offsets from the start of their slice, with the
+// special bit at bit 15. Input reads them as positions with the special bit at
+// bit 31 (see token).
 
 const SPECIAL = 0x80000000;
 const ADDRESS = 0x7fffffff;
 const OFFSET = 0x7fff;
 
+/** The most bytes one call to tokenize may cover. */
+const SLICE = 16384;
+/** The number of bytes the tokenizer's memory holds. */
+const BUFFER = 65536;
+
 /**
- * Tokenizer state: inside a string, after an odd number of backslashes,
- * inside a scalar, inside a string that has had a special character.
+ * Bit of the tokenizer state for being inside a string. The state is 4 bits
+ * (see tokenize.wat), and 0 at the start of a stream.
  */
 const IN_STRING = 1;
 
-/**
- * Tokenizes the bytes at [pos, end), at most TOKENS of them, starting in
- * `state`, writing the tokens at address 0 as offsets from `pos` and linking
- * brackets (see Input.links). Returns the number of tokens times 16 plus the
- * state at `end`.
- */
-type Tokenize = (state: number, pos: number, end: number) => number;
+/** A tokenizer with its own memory. Positions are indices into `bytes`. */
+type Tokenizer = {
+  /** BUFFER bytes for the caller to fill with the stream. */
+  bytes: Uint8Array;
+  /** The tokens of the last call, as offsets from its `start`. */
+  tokens: Uint16Array;
+  /**
+   * For the token of an opening bracket in the last call, the index of the
+   * token of its closing bracket if that is in the same call, else 0.
+   */
+  links: Uint16Array;
+  /**
+   * Tokenizes bytes[start, end), at most SLICE of them, in the stream after
+   * `state`. Returns the number of tokens times 16 plus the state at `end`.
+   * The result depends only on the arguments and the bytes.
+   */
+  tokenize(state: number, start: number, end: number): number;
+  /** The length in UTF-16 code units of the UTF-8 text at bytes[start, end). */
+  utf16Length(start: number, end: number): number;
+};
 
-/**
- * 16-bit words in the token region at the start of memory. It is followed by
- * the links of brackets, the tokenizer's stack of open brackets (both of the
- * same size, see tokenize.wat), and BUFFER bytes of input.
- */
-const TOKENS = 16384;
-const LINKS = TOKENS * 2;
-const BYTES = TOKENS * 6;
-const BUFFER = 65536;
-/** Bytes past the buffered ones that the tokenizer may read. */
-const SLACK = 64;
-const PAGE = 65536;
+/** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
+const TOKENIZER = 'AGFzbQEAAAABGQNgAX8Hfn5+fn5+fmADf39/AX9gAn9/AX8CDwEDZW52Bm1lbW9yeQIAAQMEAwABAgYdBH8AQYCAAgt/AEGAgAQLfwBBgIABC38AQYCABgsHGgIIdG9rZW5pemUAAQt1dGYxNkxlbmd0aAACCvYIA4oCBAF/AX4Fewd+A0AgACABav0ABAAhAyADQSD9D/1QIQQgBEH7AP0P/SMhBiAEQf0A/Q/9IyEHIANBLP0P/SMgA0E6/Q/9I/1QIAYgB/1Q/VAhBSABrSECIA0gBv1krSAChoQhDSAOIAf9ZK0gAoaEIQ4gCCADQSL9D/0j/WStIAKGhCEIIAkgA0HcAP0P/SP9ZK0gAoaEIQkgDCADQSD9D/0m/WStIAKGhCEMIAogBf1krSAChoQhCiALIAUgA0Eg/Q/9IyADQQn9D/0j/VAgA0EK/Q/9IyADQQ39D/0j/VD9UP1Q/WStIAKGhCELIAFBEGoiAUHAAEkNAAsgCCAJIA0gDiAKIAsgDAvnBQUDfxZ+AX8BfgJ/IAEjA2ohASACIwNqIQIgASEEIABBAXGtIQwgAEEBdkEBca0hDSAAQQJ2QQFxrSEOIABBA3atIRcCQANAIAEgAk8NASACIAFrIQUgBUHAAE8EQEHAACEFQn8hBwVCASAFrYZCAX0hBwsgBUEBa60hBiABEAAhFiELIQohGyEaIQkhCCAJIAeDIQkgFiAJhCAHgyEWIAkgCUIBhkJ/hYMhD0LVqtWq1arVqtUAIA2FIRAgCSAPIBBCf4WDfCERIAlCf4UgCSAPIBCDfEKq1arVqtWq1ap/gyARIA2EQtWq1arVqtWq1QCDhIMhEiARIAlUrSASIAWtiEIBgyAFQcAARhshDSAIIAeDIBJCf4WDIQggCCETIBMgE0IBhoUhEyATIBNCAoaFIRMgEyATQgSGhSETIBMgE0IIhoUhEyATIBNCEIaFIRMgEyATQiCGhSETIBNCACAMfYUhEyATIAaIQgGDIQwgFiATgyAXhCEWIAggCCAIIBZ9hYMhGCAWIAhWrSEXIAcgCCALhCAThEJ/hYMhFCAIIAogB4MgE0J/hYOEIBQgFEIBhiAOhEJ/hYOEIRUgFCAGiEIBgyEOIBUhHSADQQF2IRwCQANAIBVQDQEgFXohGSADIAEgBGsgGadqIBggGYinQQ90cjsBACADQQJqIQMgFSAVQgF9gyEVDAALCyAaIAcgE0J/hYODIRogGyAHIBNCf4WDgyEbIBogG4QhGgJAA0AgGlANASAaeiEZIBwgHUIBIBmGQgF9g3unaiEeIBsgGYhCAYOnBEAgHwRAIB9BAWshHyAfIwJJBEAjACMBIB9BAXRqLwEAQQF0aiAeOwEACwsFIwAgHkEBdGpBADsBACAfIwJJBEAjASAfQQF0aiAeOwEACyAfQQFqIR8LIBogGkIBfYMhGgwACwsgAUHAAGohAQwACwsgA0EDdCAMIA1CAYaEIA5CAoYgFyAMg0IDhoSEp3ILfwMBfwF7An8gACMDaiEAIAEjA2ohAQJAA0AgACABTw0BIAD9AAQAIQMgASAAayEFQf//A0EBIAV0QQFrIAVBEE8bIQQgAiAEQX8gA0HAAf0P/U5BgAH9D/0j/WRzcWkgBCADQfAB/Q/9LP1kcWlqaiECIABBEGohAAwACwsgAgs=';
+
+const tokenizerModule = new WebAssembly.Module(Uint8Array.from(atob(TOKENIZER), c => c.charCodeAt(0)));
+
+function createTokenizer(): Tokenizer {
+  // The layout of memory, which tokenize.wat assumes: the tokens, the links,
+  // and the stack of open brackets, each SLICE 16-bit words, then the bytes,
+  // and slack the tokenizer may read past them.
+  const links = SLICE * 2, bytes = SLICE * 6, slack = 64;
+  const memory = new WebAssembly.Memory({ initial: Math.ceil((bytes + BUFFER + slack) / 65536) });
+  const exports = new WebAssembly.Instance(tokenizerModule, { env: { memory } }).exports;
+  return {
+    bytes: new Uint8Array(memory.buffer, bytes, BUFFER),
+    tokens: new Uint16Array(memory.buffer, 0, SLICE),
+    links: new Uint16Array(memory.buffer, links, SLICE),
+    tokenize: exports.tokenize as Tokenizer['tokenize'],
+    utf16Length: exports.utf16Length as Tokenizer['utf16Length'],
+  };
+}
+
+// INPUT //////////////////////////////////////////////////////////////////////
+
 const NONE = Infinity;
 
 /**
@@ -176,12 +206,8 @@ type Input = {
   pendingPos: number;
   bytes: Uint8Array;
   tokens: Uint16Array;
-  /**
-   * For the token of an opening bracket, the index of the token of its
-   * closing bracket if it was found in the same call to tokenize, else 0.
-   */
   links: Uint16Array;
-  tokenize: Tokenize;
+  tokenize: Tokenizer['tokenize'];
   /** The address the tokens in the region are offsets from. */
   base: number;
   /** End of the buffered bytes. */
@@ -204,7 +230,7 @@ type Input = {
   ended: boolean;
   /** A high surrogate held back from the end of a text chunk. */
   surrogate: string;
-  utf16Length: (pos: number, end: number) => number;
+  utf16Length: Tokenizer['utf16Length'];
   /**
    * The bytes at [textStart, textEnd) decoded, and a byte address in that
    * range with the index of its character in the text.
@@ -217,14 +243,10 @@ type Input = {
 };
 
 function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
-  const memory = new WebAssembly.Memory({ initial: Math.ceil((BYTES + BUFFER + SLACK) / PAGE) });
   return {
     chunks, pending: undefined, pendingPos: 0,
-    bytes: new Uint8Array(memory.buffer),
-    tokens: new Uint16Array(memory.buffer, 0, TOKENS),
-    links: new Uint16Array(memory.buffer, LINKS, TOKENS),
-    ...tokenizer(memory),
-    base: 0, len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE, spill: [], spilled: 0,
+    ...createTokenizer(),
+    base: 0, len: 0, scanned: 0, state: 0, cursor: 0, count: 0, mark: NONE, spill: [], spilled: 0,
     ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
   };
 }
@@ -262,7 +284,7 @@ function scan(input: Input): boolean {
     // Every token has been consumed, so the region can be reused.
     input.cursor -= input.count;
     input.count = 0;
-    const end = Math.min(input.len, input.scanned + TOKENS);
+    const end = Math.min(input.len, input.scanned + SLICE);
     input.base = input.scanned;
     const result = input.tokenize(input.state, input.scanned, end);
     input.count = result >>> 4;
@@ -310,11 +332,10 @@ function drop(input: Input): void {
     input.spilled += len - keep;
     keep = input.mark = len;
   }
-  const shift = keep - BYTES;
-  bytes.copyWithin(BYTES, keep, len);
-  input.len -= shift;
-  input.scanned -= shift;
-  input.mark -= shift;
+  bytes.copyWithin(0, keep, len);
+  input.len -= keep;
+  input.scanned -= keep;
+  input.mark -= keep;
   input.textEnd = 0;
 }
 
@@ -322,7 +343,7 @@ function drop(input: Input): void {
 function fill(input: Input): void {
   const chunk = input.pending!;
   const pos = input.pendingPos;
-  const space = input.bytes.subarray(input.len, BYTES + BUFFER);
+  const space = input.bytes.subarray(input.len);
   let read;
   if (typeof chunk === 'string') {
     const result = encoder.encodeInto(pos === 0 ? chunk : chunk.slice(pos), space);
@@ -486,16 +507,6 @@ function decodeText(bytes: Uint8Array, start: number, end: number): string {
   return decoder.decode(bytes.subarray(start, end));
 }
 
-/** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
-const TOKENIZER = 'AGFzbQEAAAABGQNgAX8Hfn5+fn5+fmADf39/AX9gAn9/AX8CDwEDZW52Bm1lbW9yeQIAAQMEAwABAgYgBX8AQYCAAgt/AEGAgAQLfwBBgIABC38BQQALfwFBAAsHGgIIdG9rZW5pemUAAQt1dGYxNkxlbmd0aAACCvAIA4oCBAF/AX4Fewd+A0AgACABav0ABAAhAyADQSD9D/1QIQQgBEH7AP0P/SMhBiAEQf0A/Q/9IyEHIANBLP0P/SMgA0E6/Q/9I/1QIAYgB/1Q/VAhBSABrSECIA0gBv1krSAChoQhDSAOIAf9ZK0gAoaEIQ4gCCADQSL9D/0j/WStIAKGhCEIIAkgA0HcAP0P/SP9ZK0gAoaEIQkgDCADQSD9D/0m/WStIAKGhCEMIAogBf1krSAChoQhCiALIAUgA0Eg/Q/9IyADQQn9D/0j/VAgA0EK/Q/9IyADQQ39D/0j/VD9UP1Q/WStIAKGhCELIAFBEGoiAUHAAEkNAAsgCCAJIA0gDiAKIAsgDAvvBQUDfxZ+AX8BfgF/IAEhBCMDJAQgAEEBca0hDCAAQQF2QQFxrSENIABBAnZBAXGtIQ4gAEEDdq0hFwJAA0AgASACTw0BIAIgAWshBSAFQcAATwRAQcAAIQVCfyEHBUIBIAWthkIBfSEHCyAFQQFrrSEGIAEQACEWIQshCiEbIRohCSEIIAkgB4MhCSAWIAmEIAeDIRYgCSAJQgGGQn+FgyEPQtWq1arVqtWq1QAgDYUhECAJIA8gEEJ/hYN8IREgCUJ/hSAJIA8gEIN8QqrVqtWq1arVqn+DIBEgDYRC1arVqtWq1arVAIOEgyESIBEgCVStIBIgBa2IQgGDIAVBwABGGyENIAggB4MgEkJ/hYMhCCAIIRMgEyATQgGGhSETIBMgE0IChoUhEyATIBNCBIaFIRMgEyATQgiGhSETIBMgE0IQhoUhEyATIBNCIIaFIRMgE0IAIAx9hSETIBMgBohCAYMhDCAWIBODIBeEIRYgCCAIIAggFn2FgyEYIBYgCFatIRcgByAIIAuEIBOEQn+FgyEUIAggCiAHgyATQn+Fg4QgFCAUQgGGIA6EQn+Fg4QhFSAUIAaIQgGDIQ4gFSEdIANBAXYhHAJAA0AgFVANASAVeiEZIAMgASAEayAZp2ogGCAZiKdBD3RyOwEAIANBAmohAyAVIBVCAX2DIRUMAAsLIBogByATQn+Fg4MhGiAbIAcgE0J/hYODIRsgGiAbhCEaAkADQCAaUA0BIBp6IRkgHCAdQgEgGYZCAX2De6dqIR4gGyAZiEIBg6cEQCMDBEAjA0EBayQDIwMjBE8jAyMCSXEEQCMAIwEjA0EBdGovAQBBAXRqIB47AQALIwMjBEkEQCMDJAQLCwUjACAeQQF0akEAOwEAIwMjAkkEQCMBIwNBAXRqIB47AQALIwNBAWokAwsgGiAaQgF9gyEaDAALCyABQcAAaiEBDAALCyADQQN0IAwgDUIBhoQgDkIChiAXIAyDQgOGhISncgtxAwF/AXsCfwJAA0AgACABTw0BIAD9AAQAIQMgASAAayEFQf//A0EBIAV0QQFrIAVBEE8bIQQgAiAEQX8gA0HAAf0P/U5BgAH9D/0j/WRzcWkgBCADQfAB/Q/9LP1kcWlqaiECIABBEGohAAwACwsgAgs=';
-
-const tokenizerModule = new WebAssembly.Module(Uint8Array.from(atob(TOKENIZER), c => c.charCodeAt(0)));
-
-/** Instantiates the tokenizer to operate on `memory`. */
-function tokenizer(memory: WebAssembly.Memory): Pick<Input, 'tokenize' | 'utf16Length'> {
-  const { tokenize, utf16Length } = new WebAssembly.Instance(tokenizerModule, { env: { memory } }).exports;
-  return { tokenize: tokenize as Input['tokenize'], utf16Length: utf16Length as Input['utf16Length'] };
-}
 
 // VALUES /////////////////////////////////////////////////////////////////////
 
