@@ -184,7 +184,7 @@ async function* decode(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<string
 }
 
 const RUNS = 7;
-const ROUNDS = 5;
+const ROUNDS = 6;
 
 /** Runs a workload in a child process and returns its throughput in MB/s. */
 function measure(name: string, lib?: string): number {
@@ -235,9 +235,11 @@ if (only !== undefined) {
       continue;
     }
     const before = [], after = [];
+    // Alternates which goes first, since running first or second can matter.
     for (let i = 0; i < ROUNDS; i++) {
-      before.push(measure(name, baseLib));
+      if (i % 2 === 0) before.push(measure(name, baseLib));
       after.push(measure(name));
+      if (i % 2 === 1) before.push(measure(name, baseLib));
     }
     const change = (median(after) / median(before) - 1) * 100;
     const changeText = Number.isNaN(change) ? 'n/a' : (change >= 0 ? '+' : '') + change.toFixed(1) + '%';
