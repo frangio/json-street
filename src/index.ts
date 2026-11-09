@@ -120,15 +120,19 @@ const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 // INPUT //////////////////////////////////////////////////////////////////////
 
 // The stream is buffered as bytes in memory and tokenized in one pass. A token
-// is the address of a byte that starts something: a bracket, comma, or colon,
-// either quote of a string, or the first byte of a number, boolean, or null.
-// The kind of a token is the byte it points to. A number, boolean, or null
-// ends at the next token or the end of the stream. The token of a closing
-// quote has the SPECIAL bit set if the string has a backslash or a control
-// character, so it must be unescaped or rejected rather than just decoded.
+// locates a byte that starts something: a bracket, comma, or colon, either
+// quote of a string, or the first byte of a number, boolean, or null. The kind
+// of a token is the byte it points to. A number, boolean, or null ends at the
+// next token or the end of the stream. The token of a closing quote has the
+// SPECIAL bit set if the string has a backslash or a control character, so it
+// must be unescaped or rejected rather than just decoded.
+//
+// Tokens are stored as 16-bit offsets from Input.base, with the special bit at
+// bit 15, and read as addresses with the special bit at bit 31 (see token).
 
 const SPECIAL = 0x80000000;
 const ADDRESS = 0x7fffffff;
+const OFFSET = 0x7fff;
 
 /**
  * Tokenizer state: inside a string, after an odd number of backslashes,
@@ -137,20 +141,21 @@ const ADDRESS = 0x7fffffff;
 const IN_STRING = 1;
 
 /**
- * Tokenizes the bytes at [pos, end) starting in `state`, writing the tokens
- * as 32-bit words at `out`, which must be 0, and linking brackets (see
- * Input.links). Returns the number of tokens times 16 plus the state at `end`.
+ * Tokenizes the bytes at [pos, end), at most TOKENS of them, starting in
+ * `state`, writing the tokens at address 0 as offsets from `pos` and linking
+ * brackets (see Input.links). Returns the number of tokens times 16 plus the
+ * state at `end`.
  */
-type Tokenize = (state: number, pos: number, end: number, out: number) => number;
+type Tokenize = (state: number, pos: number, end: number) => number;
 
 /**
- * Words in the token region at the start of memory. It is followed by the
- * links of brackets, the tokenizer's stack of open brackets (both of the same
- * size, see tokenize.wat), and the bytes.
+ * 16-bit words in the token region at the start of memory. It is followed by
+ * the links of brackets, the tokenizer's stack of open brackets (both of the
+ * same size, see tokenize.wat), and the bytes.
  */
 const TOKENS = 16384;
-const LINKS = TOKENS * 4;
-const BYTES = TOKENS * 12;
+const LINKS = TOKENS * 2;
+const BYTES = TOKENS * 6;
 /** Bytes past the buffered ones that the tokenizer may read. */
 const SLACK = 64;
 const PAGE = 65536;
@@ -165,13 +170,15 @@ type Input = {
   memory: WebAssembly.Memory;
   /** Views of memory, renewed when it grows. */
   bytes: Uint8Array;
-  tokens: Uint32Array;
+  tokens: Uint16Array;
   /**
    * For the token of an opening bracket, the index of the token of its
    * closing bracket if it was found in the same call to tokenize, else 0.
    */
-  links: Uint32Array;
+  links: Uint16Array;
   tokenize: Tokenize;
+  /** The address the tokens in the region are offsets from. */
+  base: number;
   /** End of the buffered bytes. */
   len: number;
   /** End of the tokenized bytes, and the tokenizer state there. */
@@ -200,7 +207,7 @@ type Input = {
 function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
   const memory = new WebAssembly.Memory({ initial: 4 });
   const input: Input = {
-    chunks, memory, bytes: new Uint8Array(), tokens: new Uint32Array(), links: new Uint32Array(),
+    chunks, memory, bytes: new Uint8Array(), tokens: new Uint16Array(), links: new Uint16Array(), base: 0,
     ...tokenizer(memory),
     len: BYTES, scanned: BYTES, state: 0, cursor: 0, count: 0, mark: NONE,
     ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
@@ -211,8 +218,8 @@ function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
 
 function renewViews(input: Input): void {
   input.bytes = new Uint8Array(input.memory.buffer);
-  input.tokens = new Uint32Array(input.memory.buffer, 0, TOKENS);
-  input.links = new Uint32Array(input.memory.buffer, LINKS, TOKENS);
+  input.tokens = new Uint16Array(input.memory.buffer, 0, TOKENS);
+  input.links = new Uint16Array(input.memory.buffer, LINKS, TOKENS);
 }
 
 // Functions that may have to wait for input return a promise only when they
@@ -228,7 +235,13 @@ function peek(input: Input): number {
     if (input.state & IN_STRING) throw unexpected(EOF);
     return EOF;
   }
-  return input.bytes[input.tokens[input.cursor]! & ADDRESS]!;
+  return input.bytes[input.base + (input.tokens[input.cursor]! & OFFSET)]!;
+}
+
+/** The address of the token at index `i`, with its SPECIAL bit. */
+function token(input: Input, i: number): number {
+  const t = input.tokens[i]!;
+  return input.base + (t & OFFSET) + (t >>> 15) * SPECIAL;
 }
 
 /**
@@ -243,7 +256,8 @@ function scan(input: Input): boolean {
     input.cursor -= input.count;
     input.count = 0;
     const end = Math.min(input.len, input.scanned + TOKENS);
-    const result = input.tokenize(input.state, input.scanned, end, 0);
+    input.base = input.scanned;
+    const result = input.tokenize(input.state, input.scanned, end);
     input.count = result >>> 4;
     input.state = result & 15;
     input.scanned = end;
@@ -308,12 +322,12 @@ function reserve(input: Input, n: number): void {
  * has to wait for input.
  */
 function consumeValue(input: Input): number | Promise<number> {
-  const c = input.bytes[input.tokens[input.cursor++]!]!;
+  const c = input.bytes[token(input, input.cursor++) & ADDRESS]!;
   if (c === LBRACKET || c === LBRACE) {
     const link = input.links[input.cursor - 1]!;
     if (link === 0) return exitContainer(input, 1);
     input.cursor = link + 1;
-    return input.tokens[link]! + 1;
+    return token(input, link) + 1;
   }
   if (c === QUOTE) return exitString(input);
   return scalarEnd(input);
@@ -327,14 +341,14 @@ function exitString(input: Input): number | Promise<number> {
   // Inside a string the only token is the closing quote, and peek fails if
   // the input ends first.
   if (peek(input) === MORE) return more(input).then(() => exitString(input));
-  return input.tokens[input.cursor++]! + 1;
+  return token(input, input.cursor++) + 1;
 }
 
 /** Returns the end of the scalar consumed last, which is the next token. */
 function scalarEnd(input: Input): number | Promise<number> {
   const c = peek(input);
   if (c === MORE) return more(input).then(() => scalarEnd(input));
-  return c === EOF ? input.len : input.tokens[input.cursor]!;
+  return c === EOF ? input.len : token(input, input.cursor);
 }
 
 /**
@@ -343,16 +357,16 @@ function scalarEnd(input: Input): number | Promise<number> {
  */
 function exitContainer(input: Input, depth: number): number | Promise<number> {
   for (;;) {
-    const { bytes, tokens, links, count } = input;
+    const { bytes, tokens, links, count, base } = input;
     for (let i = input.cursor; i < count; i++) {
-      const c = bytes[tokens[i]! & ADDRESS]!;
+      const c = bytes[base + (tokens[i]! & OFFSET)]!;
       if (c === LBRACKET || c === LBRACE) {
         const link = links[i]!;
         if (link === 0) depth++;
         else i = link;
       } else if ((c === RBRACKET || c === RBRACE) && --depth === 0) {
         input.cursor = i + 1;
-        return tokens[i]! + 1;
+        return base + tokens[i]! + 1;
       }
     }
     input.cursor = Math.max(input.cursor, count);
@@ -367,7 +381,7 @@ function exitContainer(input: Input, depth: number): number | Promise<number> {
  * Returns a promise if it has to wait for input.
  */
 function parseValue(input: Input): unknown {
-  input.mark = input.tokens[input.cursor]!;
+  input.mark = token(input, input.cursor);
   const end = consumeValue(input);
   return typeof end === 'number' ? parseMarked(input, end) : end.then(end => parseMarked(input, end));
 }
@@ -440,7 +454,7 @@ function decodeText(bytes: Uint8Array, start: number, end: number): string {
 }
 
 /** The tokenizer in WebAssembly, built from tokenize.wat by `npm run wasm`. */
-const TOKENIZER = 'AGFzbQEAAAABGgNgAX8Hfn5+fn5+fmAEf39/fwF/YAJ/fwF/Ag8BA2VudgZtZW1vcnkCAAEDBAMAAQIGIAV/AEGAgAQLfwBBgIAIC38AQYCAAQt/AUEAC38BQQALBxoCCHRva2VuaXplAAELdXRmMTZMZW5ndGgAAgrzCAOKAgQBfwF+BXsHfgNAIAAgAWr9AAQAIQMgA0Eg/Q/9UCEEIARB+wD9D/0jIQYgBEH9AP0P/SMhByADQSz9D/0jIANBOv0P/SP9UCAGIAf9UP1QIQUgAa0hAiANIAb9ZK0gAoaEIQ0gDiAH/WStIAKGhCEOIAggA0Ei/Q/9I/1krSAChoQhCCAJIANB3AD9D/0j/WStIAKGhCEJIAwgA0Eg/Q/9Jv1krSAChoQhDCAKIAX9ZK0gAoaEIQogCyAFIANBIP0P/SMgA0EJ/Q/9I/1QIANBCv0P/SMgA0EN/Q/9I/1Q/VD9UP1krSAChoQhCyABQRBqIgFBwABJDQALIAggCSANIA4gCiALIAwL8gUFAn8WfgF/AX4BfyADIQQjAyQEIABBAXGtIQwgAEEBdkEBca0hDSAAQQJ2QQFxrSEOIABBA3atIRcCQANAIAEgAk8NASACIAFrIQUgBUHAAE8EQEHAACEFQn8hBwVCASAFrYZCAX0hBwsgBUEBa60hBiABEAAhFiELIQohGyEaIQkhCCAJIAeDIQkgFiAJhCAHgyEWIAkgCUIBhkJ/hYMhD0LVqtWq1arVqtUAIA2FIRAgCSAPIBBCf4WDfCERIAlCf4UgCSAPIBCDfEKq1arVqtWq1ap/gyARIA2EQtWq1arVqtWq1QCDhIMhEiARIAlUrSASIAWtiEIBgyAFQcAARhshDSAIIAeDIBJCf4WDIQggCCETIBMgE0IBhoUhEyATIBNCAoaFIRMgEyATQgSGhSETIBMgE0IIhoUhEyATIBNCEIaFIRMgEyATQiCGhSETIBNCACAMfYUhEyATIAaIQgGDIQwgFiATgyAXhCEWIAggCCAIIBZ9hYMhGCAWIAhWrSEXIAcgCCALhCAThEJ/hYMhFCAIIAogB4MgE0J/hYOEIBQgFEIBhiAOhEJ/hYOEIRUgFCAGiEIBgyEOIBUhHSADIARrQQJ2IRwCQANAIBVQDQEgFXohGSADIAEgGadqIBggGYinQR90cjYCACADQQRqIQMgFSAVQgF9gyEVDAALCyAaIAcgE0J/hYODIRogGyAHIBNCf4WDgyEbIBogG4QhGgJAA0AgGlANASAaeiEZIBwgHUIBIBmGQgF9g3unaiEeIBsgGYhCAYOnBEAjAwRAIwNBAWskAyMDIwRPIwMjAklxBEAjACMBIwNBAnRqKAIAQQJ0aiAeNgIACyMDIwRJBEAjAyQECwsFIwAgHkECdGpBADYCACMDIwJJBEAjASMDQQJ0aiAeNgIACyMDQQFqJAMLIBogGkIBfYMhGgwACwsgAUHAAGohAQwACwsgAyAEa0ECdCAMIA1CAYaEIA5CAoYgFyAMg0IDhoSEp3ILcQMBfwF7An8CQANAIAAgAU8NASAA/QAEACEDIAEgAGshBUH//wNBASAFdEEBayAFQRBPGyEEIAIgBEF/IANBwAH9D/1OQYAB/Q/9I/1kc3FpIAQgA0HwAf0P/Sz9ZHFpamohAiAAQRBqIQAMAAsLIAIL';
+const TOKENIZER = 'AGFzbQEAAAABGQNgAX8Hfn5+fn5+fmADf39/AX9gAn9/AX8CDwEDZW52Bm1lbW9yeQIAAQMEAwABAgYgBX8AQYCAAgt/AEGAgAQLfwBBgIABC38BQQALfwFBAAsHGgIIdG9rZW5pemUAAQt1dGYxNkxlbmd0aAACCvAIA4oCBAF/AX4Fewd+A0AgACABav0ABAAhAyADQSD9D/1QIQQgBEH7AP0P/SMhBiAEQf0A/Q/9IyEHIANBLP0P/SMgA0E6/Q/9I/1QIAYgB/1Q/VAhBSABrSECIA0gBv1krSAChoQhDSAOIAf9ZK0gAoaEIQ4gCCADQSL9D/0j/WStIAKGhCEIIAkgA0HcAP0P/SP9ZK0gAoaEIQkgDCADQSD9D/0m/WStIAKGhCEMIAogBf1krSAChoQhCiALIAUgA0Eg/Q/9IyADQQn9D/0j/VAgA0EK/Q/9IyADQQ39D/0j/VD9UP1Q/WStIAKGhCELIAFBEGoiAUHAAEkNAAsgCCAJIA0gDiAKIAsgDAvvBQUDfxZ+AX8BfgF/IAEhBCMDJAQgAEEBca0hDCAAQQF2QQFxrSENIABBAnZBAXGtIQ4gAEEDdq0hFwJAA0AgASACTw0BIAIgAWshBSAFQcAATwRAQcAAIQVCfyEHBUIBIAWthkIBfSEHCyAFQQFrrSEGIAEQACEWIQshCiEbIRohCSEIIAkgB4MhCSAWIAmEIAeDIRYgCSAJQgGGQn+FgyEPQtWq1arVqtWq1QAgDYUhECAJIA8gEEJ/hYN8IREgCUJ/hSAJIA8gEIN8QqrVqtWq1arVqn+DIBEgDYRC1arVqtWq1arVAIOEgyESIBEgCVStIBIgBa2IQgGDIAVBwABGGyENIAggB4MgEkJ/hYMhCCAIIRMgEyATQgGGhSETIBMgE0IChoUhEyATIBNCBIaFIRMgEyATQgiGhSETIBMgE0IQhoUhEyATIBNCIIaFIRMgE0IAIAx9hSETIBMgBohCAYMhDCAWIBODIBeEIRYgCCAIIAggFn2FgyEYIBYgCFatIRcgByAIIAuEIBOEQn+FgyEUIAggCiAHgyATQn+Fg4QgFCAUQgGGIA6EQn+Fg4QhFSAUIAaIQgGDIQ4gFSEdIANBAXYhHAJAA0AgFVANASAVeiEZIAMgASAEayAZp2ogGCAZiKdBD3RyOwEAIANBAmohAyAVIBVCAX2DIRUMAAsLIBogByATQn+Fg4MhGiAbIAcgE0J/hYODIRsgGiAbhCEaAkADQCAaUA0BIBp6IRkgHCAdQgEgGYZCAX2De6dqIR4gGyAZiEIBg6cEQCMDBEAjA0EBayQDIwMjBE8jAyMCSXEEQCMAIwEjA0EBdGovAQBBAXRqIB47AQALIwMjBEkEQCMDJAQLCwUjACAeQQF0akEAOwEAIwMjAkkEQCMBIwNBAXRqIB47AQALIwNBAWokAwsgGiAaQgF9gyEaDAALCyABQcAAaiEBDAALCyADQQN0IAwgDUIBhoQgDkIChiAXIAyDQgOGhISncgtxAwF/AXsCfwJAA0AgACABTw0BIAD9AAQAIQMgASAAayEFQf//A0EBIAV0QQFrIAVBEE8bIQQgAiAEQX8gA0HAAf0P/U5BgAH9D/0j/WRzcWkgBCADQfAB/Q/9LP1kcWlqaiECIABBEGohAAwACwsgAgs=';
 
 const tokenizerModule = new WebAssembly.Module(Uint8Array.from(atob(TOKENIZER), c => c.charCodeAt(0)));
 
@@ -507,11 +521,11 @@ class Value implements JsonStValue {
         const c = peek(input);
         if (c === MORE && input.mark === input.len) return more(input).then(step);
         closed = c !== MORE;
-        const token = closed ? input.tokens[input.cursor]! : input.len;
-        const end = token & ADDRESS;
+        const t = closed ? token(input, input.cursor) : input.len;
+        const end = t & ADDRESS;
         if (closed && partial === undefined) {
           // The whole string arrived at once.
-          const text = decodeString(input.bytes, input.mark, end, token >= SPECIAL);
+          const text = decodeString(input.bytes, input.mark, end, t >= SPECIAL);
           input.cursor++;
           input.mark = NONE;
           this.#state = DONE;
@@ -690,7 +704,7 @@ class Value implements JsonStValue {
     }
     const input = this.#input;
     // For strings, the mark is where the contents start.
-    if (open === QUOTE) input.mark = input.tokens[input.cursor]! + 1;
+    if (open === QUOTE) input.mark = token(input, input.cursor) + 1;
     input.cursor++;
     this.#entered = true;
   }

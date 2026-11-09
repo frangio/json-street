@@ -9,20 +9,22 @@
 ;; It reads up to 63 bytes past `end`, which must be in memory. They don't
 ;; affect the result.
 ;;
-;; The token of the closing quote of a string has bit 31 set when the string
+;; Tokens are 16-bit words at address 0: the offset of the token's byte from
+;; `pos`, which is less than 2^15 since `end - pos` must be at most 16384. The
+;; token of the closing quote of a string has bit 15 set when the string
 ;; contains a backslash or a control character, so needs more than decoding.
 ;;
 ;; It also matches brackets: when a bracket closes in the same call that it
-;; opened in, the index of its token is written at $LINKS + 4 × the index of
-;; the opening bracket's token. Every other opening bracket gets 0 there.
+;; opened in, the index of its token is written as a 16-bit word at $LINKS +
+;; 2 × the index of the opening bracket's token. Every other opening bracket gets 0 there.
 ;; Open brackets are kept on a stack at $STACK, of at most $CAP entries, which
 ;; persists across calls. Entries from earlier calls are not linked, since
 ;; their tokens are gone.
 (module
   (import "env" "memory" (memory 1))
 
-  (global $LINKS i32 (i32.const 65536))
-  (global $STACK i32 (i32.const 131072))
+  (global $LINKS i32 (i32.const 32768))
+  (global $STACK i32 (i32.const 65536))
   (global $CAP i32 (i32.const 16384))
   ;; The number of open brackets, and the depth below which entries of the
   ;; stack come from earlier calls.
@@ -82,8 +84,8 @@
     (local.get $quote) (local.get $backslash) (local.get $open) (local.get $close)
     (local.get $struct) (local.get $space) (local.get $control))
 
-  (func (export "tokenize") (param $state i32) (param $pos i32) (param $end i32) (param $out i32) (result i32)
-    (local $first i32) (local $n i32) (local $last i64) (local $valid i64)
+  (func (export "tokenize") (param $state i32) (param $pos i32) (param $end i32) (result i32)
+    (local $out i32) (local $base i32) (local $n i32) (local $last i64) (local $valid i64)
     (local $quote i64) (local $backslash i64) (local $struct i64) (local $delim i64)
     (local $inString i64) (local $escaped i64) (local $inScalar i64)
     (local $starts i64) (local $even i64) (local $oddCarries i64) (local $escapes i64)
@@ -94,7 +96,7 @@
     ;; Opening and closing brackets outside strings, the index of the first
     ;; token of the block, and the tokens of the block.
     (local $open i64) (local $close i64) (local $index i32) (local $blockTokens i64) (local $at i32)
-    (local.set $first (local.get $out))
+    (local.set $base (local.get $pos))
     (global.set $floor (global.get $depth))
     (local.set $inString (i64.extend_i32_u (i32.and (local.get $state) (i32.const 1))))
     (local.set $escaped (i64.extend_i32_u (i32.and (i32.shr_u (local.get $state) (i32.const 1)) (i32.const 1))))
@@ -193,16 +195,16 @@
         (local.set $inScalar (i64.and (i64.shr_u (local.get $scalar) (local.get $last)) (i64.const 1)))
 
         (local.set $blockTokens (local.get $tokens))
-        (local.set $index (i32.shr_u (i32.sub (local.get $out) (local.get $first)) (i32.const 2)))
+        (local.set $index (i32.shr_u (local.get $out) (i32.const 1)))
         (block $written
           (loop $write
             (br_if $written (i64.eqz (local.get $tokens)))
             (local.set $bit (i64.ctz (local.get $tokens)))
-            (i32.store (local.get $out)
+            (i32.store16 (local.get $out)
               (i32.or
-                (i32.add (local.get $pos) (i32.wrap_i64 (local.get $bit)))
-                (i32.shl (i32.wrap_i64 (i64.shr_u (local.get $flagged) (local.get $bit))) (i32.const 31))))
-            (local.set $out (i32.add (local.get $out) (i32.const 4)))
+                (i32.add (i32.sub (local.get $pos) (local.get $base)) (i32.wrap_i64 (local.get $bit)))
+                (i32.shl (i32.wrap_i64 (i64.shr_u (local.get $flagged) (local.get $bit))) (i32.const 15))))
+            (local.set $out (i32.add (local.get $out) (i32.const 2)))
             (local.set $tokens (i64.and (local.get $tokens)
               (i64.sub (local.get $tokens) (i64.const 1))))
             (br $write)))
@@ -228,18 +230,18 @@
                     (if (i32.and
                           (i32.ge_u (global.get $depth) (global.get $floor))
                           (i32.lt_u (global.get $depth) (global.get $CAP)))
-                      (then (i32.store
+                      (then (i32.store16
                         (i32.add (global.get $LINKS) (i32.shl
-                          (i32.load (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 2))))
-                          (i32.const 2)))
+                          (i32.load16_u (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 1))))
+                          (i32.const 1)))
                         (local.get $at))))
                     (if (i32.lt_u (global.get $depth) (global.get $floor))
                       (then (global.set $floor (global.get $depth)))))))
               (else
-                (i32.store (i32.add (global.get $LINKS) (i32.shl (local.get $at) (i32.const 2))) (i32.const 0))
+                (i32.store16 (i32.add (global.get $LINKS) (i32.shl (local.get $at) (i32.const 1))) (i32.const 0))
                 (if (i32.lt_u (global.get $depth) (global.get $CAP))
-                  (then (i32.store
-                    (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 2)))
+                  (then (i32.store16
+                    (i32.add (global.get $STACK) (i32.shl (global.get $depth) (i32.const 1)))
                     (local.get $at))))
                 (global.set $depth (i32.add (global.get $depth) (i32.const 1)))))
             (local.set $open (i64.and (local.get $open) (i64.sub (local.get $open) (i64.const 1))))
@@ -248,7 +250,7 @@
         (local.set $pos (i32.add (local.get $pos) (i32.const 64)))
         (br $blocks)))
     (i32.or
-      (i32.shl (i32.sub (local.get $out) (local.get $first)) (i32.const 2))
+      (i32.shl (local.get $out) (i32.const 3))
       (i32.wrap_i64 (i64.or
         (i64.or (local.get $inString) (i64.shl (local.get $escaped) (i64.const 1)))
         (i64.or
