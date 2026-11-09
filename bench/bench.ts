@@ -97,7 +97,10 @@ async function read(value: JsonStValue, expected: unknown): Promise<unknown> {
   }
 }
 
-/** Input is UTF-8 bytes in 64 KB chunks unless the workload says otherwise. */
+/**
+ * Input is UTF-8 bytes in 16 KB chunks, the most a TLS record carries, unless
+ * the workload says otherwise.
+ */
 type Workload = {
   name: string;
   json: string;
@@ -219,7 +222,7 @@ function median(xs: number[]): number {
 }
 
 if (only !== undefined) {
-  const { json, chunkSize = 65536, text, run } = workloads.find(w => w.name === only)!;
+  const { json, chunkSize = 16384, text, run } = workloads.find(w => w.name === only)!;
   const bytes = !text && await acceptsBytes();
   const input = text ? chunks(json, chunkSize) : chunks(new TextEncoder().encode(json), chunkSize);
   const once = () => run(parseValues(text || bytes ? stream<string | Uint8Array>(input) : decode(stream(input as Uint8Array[]))));
