@@ -11,7 +11,7 @@
 // of its time, as it would be for its users.
 
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { JsonStValue } from '../src/index.ts';
@@ -45,15 +45,26 @@ function record(id: number) {
 }
 
 const SIZE = 10e6;
-const records: ReturnType<typeof record>[] = [];
-for (let id = 0, size = 0; size < SIZE; id++) {
-  const r = record(id);
-  records.push(r);
-  size += JSON.stringify(r).length;
+function generate() {
+  const records: ReturnType<typeof record>[] = [];
+  for (let id = 0, size = 0; size < SIZE; id++) {
+    const r = record(id);
+    records.push(r);
+    size += JSON.stringify(r).length;
+  }
+  return {
+    recordsJson: JSON.stringify(records),
+    ndjson: records.map(r => JSON.stringify(r)).join('\n'),
+    longStrings: JSON.stringify(Array.from({ length: 20 }, () => text(SIZE / 20 / 6))),
+  };
 }
-const recordsJson = JSON.stringify(records);
-const ndjson = records.map(r => JSON.stringify(r)).join('\n');
-const longStrings = JSON.stringify(Array.from({ length: 20 }, () => text(SIZE / 20 / 6)));
+
+// The parent generates the documents once and passes them to each measurement.
+const only = process.env.JSONST_WORKLOAD;
+const documents: ReturnType<typeof generate> =
+  only === undefined ? generate() : JSON.parse(readFileSync(process.env.JSONST_DOCUMENTS!, 'utf8'));
+const { recordsJson, ndjson, longStrings } = documents;
+const records = JSON.parse(recordsJson);
 
 function chunks<T extends string | Uint8Array>(text: T, size: number): T[] {
   const result = [];
@@ -185,13 +196,13 @@ async function* decode(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<string
 }
 
 // Long enough to average over many GC cycles, which a short run may dodge.
-const WARMUP_MS = 500;
-const MEASURE_MS = 2000;
-const ROUNDS = 6;
+const WARMUP_MS = 300;
+const MEASURE_MS = 1000;
+const ROUNDS = 3;
 
 /** Runs a workload in a child process and returns its throughput in MB/s. */
 function measure(name: string, lib?: string): number {
-  const env = { ...process.env, JSONST_WORKLOAD: name, JSONST_LIB: lib };
+  const env = { ...process.env, JSONST_WORKLOAD: name, JSONST_LIB: lib, JSONST_DOCUMENTS: documentsFile };
   try {
     return Number(execFileSync(process.execPath, [import.meta.filename], { env, encoding: 'utf8', stdio: 'pipe' }));
   } catch (error) {
@@ -200,11 +211,12 @@ function measure(name: string, lib?: string): number {
   }
 }
 
+const documentsFile = join(tmpdir(), `jsonst-documents-${process.pid}.json`);
+if (only === undefined) writeFileSync(documentsFile, JSON.stringify(documents));
+
 function median(xs: number[]): number {
   return [...xs].sort((a, b) => a - b)[xs.length >> 1]!;
 }
-
-const only = process.env.JSONST_WORKLOAD;
 
 if (only !== undefined) {
   const { json, chunkSize = 65536, text, run } = workloads.find(w => w.name === only)!;
@@ -252,4 +264,5 @@ if (only !== undefined) {
     const spread = Math.max(...[before, after].map(xs => (Math.max(...xs) - Math.min(...xs)) / median(xs) * 100));
     console.log(`${name.padEnd(40)} ${fmt(median(before))} ${fmt(median(after))} ${changeText.padStart(8)} ${(spread.toFixed(1) + '%').padStart(8)}`);
   }
+  rmSync(documentsFile);
 }
