@@ -37,7 +37,7 @@ export function parseValues(stream: AsyncIterable<Uint8Array | string>): AsyncIt
     // The consumer may stop iterating while a parse is in progress, as in
     // `for await (const v of parseValues(s)) return v.parse();`
     await value?.parsed();
-    await input.chunks.return?.();
+    await input.w.source.return?.();
   });
 }
 
@@ -124,15 +124,13 @@ const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 // quote of a string, or the first byte of a number, boolean, or null. The kind
 // of a token is the byte it points to. A number, boolean, or null ends at the
 // next token or the end of the stream. The token of a closing quote has the
-// SPECIAL bit set if the string has a backslash or a control character, so it
+// special bit set if the string has a backslash or a control character, so it
 // must be unescaped or rejected rather than just decoded.
 //
 // Tokens are stored as 16-bit offsets from the start of their slice, with the
 // special bit at bit 15. Input reads them as positions with the special bit at
 // bit 31 (see token).
 
-const SPECIAL = 0x80000000;
-const ADDRESS = 0x7fffffff;
 const OFFSET = 0x7fff;
 
 /** The most bytes one call to tokenize may cover. */
@@ -188,52 +186,43 @@ function createTokenizer(): Tokenizer {
   };
 }
 
-// INPUT //////////////////////////////////////////////////////////////////////
+// WINDOW /////////////////////////////////////////////////////////////////////
 
 const NONE = Infinity;
 
 /**
- * The bytes of the stream and their tokens, hiding chunk boundaries. The
- * memory has a fixed size: chunks are copied in as space allows, and the
- * bytes of a value being parsed that would fill more than half the buffer are
- * decoded to `spill`. Fields holding addresses (`len`, `scanned`, `mark`) are
- * updated when bytes move.
+ * A stream of bytes, buffered in the tokenizer's bytes as space allows.
+ * Positions are offsets in the stream, which never change when bytes move.
+ * Only bytes from `pin` on stay readable after a fill, through `text`.
  */
-type Input = {
-  chunks: AsyncIterator<Uint8Array | string>;
-  /** The part of the last chunk not copied yet, from `pendingPos`. */
+type Window = {
+  /** The buffered bytes: bytes[i] is at position origin + i. */
+  bytes: Uint8Array;
+  origin: number;
+  /** The position after the last buffered byte. */
+  end: number;
+  /** Whether `end` is the end of the stream. */
+  ended: boolean;
+  /** The earliest position the reader still needs, or NONE. */
+  pin: number;
+  // The rest is private to this section.
+  source: AsyncIterator<Uint8Array | string>;
+  /** The part of the last chunk not buffered yet, from `pendingPos`. */
   pending: Uint8Array | string | undefined;
   pendingPos: number;
-  bytes: Uint8Array;
-  tokens: Uint16Array;
-  links: Uint16Array;
-  tokenize: Tokenizer['tokenize'];
-  /** The address the tokens in the region are offsets from. */
-  base: number;
-  /** End of the buffered bytes. */
-  len: number;
-  /** End of the tokenized bytes, and the tokenizer state there. */
-  scanned: number;
-  state: number;
-  /** Index of the next token, and the number of tokens in the region. */
-  cursor: number;
-  count: number;
-  /** The earliest byte the consumer still needs, or NONE. */
-  mark: number;
-  /**
-   * The bytes of the value at `mark` before it, dropped from the buffer, and
-   * their number. They are decoded with the rest of the value, because
-   * JSON.parse would copy text joined from pieces.
-   */
-  spill: Uint8Array[];
-  spilled: number;
-  ended: boolean;
   /** A high surrogate held back from the end of a text chunk. */
   surrogate: string;
+  /**
+   * Pinned bytes dropped from the buffer, from position `spillStart`. They are
+   * joined and decoded with the rest of their range, because JSON.parse would
+   * copy text joined from pieces.
+   */
+  spill: Uint8Array[];
+  spillStart: number;
   utf16Length: Tokenizer['utf16Length'];
   /**
-   * The bytes at [textStart, textEnd) decoded, and a byte address in that
-   * range with the index of its character in the text.
+   * The bytes at [textStart, textEnd) decoded, and a position in that range
+   * with the index of its character in the text.
    */
   text: string;
   textStart: number;
@@ -242,252 +231,128 @@ type Input = {
   textIndex: number;
 };
 
-function createInput(chunks: AsyncIterator<Uint8Array | string>): Input {
+function createWindow(source: AsyncIterator<Uint8Array | string>, tokenizer: Tokenizer): Window {
   return {
-    chunks, pending: undefined, pendingPos: 0,
-    ...createTokenizer(),
-    base: 0, len: 0, scanned: 0, state: 0, cursor: 0, count: 0, mark: NONE, spill: [], spilled: 0,
-    ended: false, surrogate: '', text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
+    bytes: tokenizer.bytes, origin: 0, end: 0, ended: false, pin: NONE,
+    source, pending: undefined, pendingPos: 0, surrogate: '', spill: [], spillStart: NONE,
+    utf16Length: tokenizer.utf16Length, text: '', textStart: 0, textEnd: 0, textByte: 0, textIndex: 0,
   };
 }
 
-// Functions that may have to wait for input return a promise only when they
-// do, to avoid the cost of awaiting when the input is already buffered.
-
 /**
- * Returns the kind of the next token, EOF, or MORE if the buffered input ran
- * out (see more).
+ * Buffers more of the stream, waiting for the next chunk if the last one has
+ * been buffered, or sets `ended`. Only bytes from `pin` on are kept.
  */
-function peek(input: Input): number {
-  if (input.cursor >= input.count && !scan(input)) {
-    if (!input.ended) return MORE;
-    if (input.state & IN_STRING) throw unexpected(EOF);
-    return EOF;
-  }
-  return input.bytes[input.base + (input.tokens[input.cursor]! & OFFSET)]!;
-}
-
-/** The address of the token at index `i`, with its SPECIAL bit. */
-function token(input: Input, i: number): number {
-  const t = input.tokens[i]!;
-  return input.base + (t & OFFSET) + (t >>> 15) * SPECIAL;
-}
-
-/**
- * Tokenizes buffered bytes until the token at the cursor exists. Returns false
- * if the buffered bytes ran out first. The cursor may be past the tokens
- * found so far, to skip tokens that haven't been found yet.
- */
-function scan(input: Input): boolean {
-  while (input.cursor >= input.count) {
-    if (input.scanned === input.len) return false;
-    // Every token has been consumed, so the region can be reused.
-    input.cursor -= input.count;
-    input.count = 0;
-    const end = Math.min(input.len, input.scanned + SLICE);
-    input.base = input.scanned;
-    const result = input.tokenize(input.state, input.scanned, end);
-    input.count = result >>> 4;
-    input.state = result & 15;
-    input.scanned = end;
-  }
-  return true;
-}
-
-/**
- * Buffers more input, waiting for the next chunk if the last one has been
- * copied. Must be called with every buffered byte tokenized and every token
- * consumed.
- */
-async function more(input: Input): Promise<void> {
-  if (input.pending === undefined) {
-    const { done, value } = await input.chunks.next();
+async function fill(w: Window): Promise<void> {
+  if (w.pending === undefined) {
+    const { done, value } = await w.source.next();
     let chunk = value;
     if (done) {
-      input.ended = true;
-      chunk = input.surrogate;
+      w.ended = true;
+      chunk = w.surrogate;
     } else if (typeof chunk === 'string') {
       // A surrogate pair split across chunks can't be encoded separately.
-      chunk = input.surrogate + chunk;
+      chunk = w.surrogate + chunk;
       const last = chunk.charCodeAt(chunk.length - 1);
-      input.surrogate = last >= 0xd800 && last < 0xdc00 ? chunk.slice(-1) : '';
-      if (input.surrogate) chunk = chunk.slice(0, -1);
+      w.surrogate = last >= 0xd800 && last < 0xdc00 ? chunk.slice(-1) : '';
+      if (w.surrogate) chunk = chunk.slice(0, -1);
     }
-    input.pending = chunk;
-    input.pendingPos = 0;
+    w.pending = chunk;
+    w.pendingPos = 0;
   }
-  drop(input);
-  fill(input);
+  drop(w);
+  copyPending(w);
 }
 
 /**
- * Moves the bytes still needed to the start of the buffer, first copying
- * those of a value being parsed to `spill` if they fill more than half of it.
+ * Moves the pinned bytes to the start of the buffer, first spilling them if
+ * they fill more than half of it.
  */
-function drop(input: Input): void {
-  const { bytes, len } = input;
-  let keep = Math.min(input.mark, len);
-  if (len - keep > BUFFER / 2) {
-    input.spill.push(bytes.slice(keep, len));
-    input.spilled += len - keep;
-    keep = input.mark = len;
+function drop(w: Window): void {
+  const { bytes, end } = w;
+  // A spill belongs to the range pinned when it was made.
+  if (w.spillStart !== w.pin) {
+    w.spill = [];
+    w.spillStart = NONE;
   }
-  bytes.copyWithin(0, keep, len);
-  input.len -= keep;
-  input.scanned -= keep;
-  input.mark -= keep;
-  input.textEnd = 0;
+  const keep = Math.max(w.origin, Math.min(w.pin, end));
+  if (end - keep > BUFFER / 2) {
+    w.spill.push(bytes.slice(keep - w.origin, end - w.origin));
+    w.spillStart = w.pin;
+    w.origin = end;
+  } else {
+    bytes.copyWithin(0, keep - w.origin, end - w.origin);
+    w.origin = keep;
+  }
+  w.textEnd = 0;
 }
 
 /** Copies as much of the pending chunk as fits in the buffer. */
-function fill(input: Input): void {
-  const chunk = input.pending!;
-  const pos = input.pendingPos;
-  const space = input.bytes.subarray(input.len);
+function copyPending(w: Window): void {
+  const chunk = w.pending!;
+  const pos = w.pendingPos;
+  const space = w.bytes.subarray(w.end - w.origin);
   let read;
   if (typeof chunk === 'string') {
     const result = encoder.encodeInto(pos === 0 ? chunk : chunk.slice(pos), space);
     read = result.read;
-    input.len += result.written;
+    w.end += result.written;
   } else {
     read = Math.min(space.length, chunk.length - pos);
     space.set(pos === 0 && read === chunk.length ? chunk : chunk.subarray(pos, pos + read));
-    input.len += read;
+    w.end += read;
   }
-  input.pendingPos += read;
-  if (input.pendingPos === chunk.length) input.pending = undefined;
+  w.pendingPos += read;
+  if (w.pendingPos === chunk.length) w.pending = undefined;
 }
 
 /**
- * Consumes the value that starts at the next token, returning the address
- * right after it, with the SPECIAL bit for a string. Returns a promise if it
- * has to wait for input.
+ * Decodes the bytes at [start, end), which start and end at characters and
+ * are readable: buffered, or from the pin on. The text holds on to nothing.
  */
-function consumeValue(input: Input): number | Promise<number> {
-  const c = input.bytes[token(input, input.cursor++) & ADDRESS]!;
-  if (c === LBRACKET || c === LBRACE) {
-    const link = input.links[input.cursor - 1]!;
-    if (link === 0) return exitContainer(input, 1);
-    input.cursor = link + 1;
-    return token(input, link) + 1;
+function text(w: Window, start: number, end: number): string {
+  if (start >= w.origin) return decodeText(w.bytes, start - w.origin, end - w.origin);
+  const all = new Uint8Array(end - w.spillStart);
+  let at = 0;
+  for (const piece of w.spill) {
+    all.set(piece, at);
+    at += piece.length;
   }
-  if (c === QUOTE) return exitString(input);
-  return scalarEnd(input);
+  all.set(w.bytes.subarray(0, end - w.origin), at);
+  return decoder.decode(all.subarray(start - w.spillStart));
 }
 
 /**
- * Consumes the closing quote of a string, returning the address after it,
- * with the SPECIAL bit of the closing quote.
+ * Like `text`, but may slice the text from text decoded once for the whole
+ * buffer, which saves the fixed cost of decoding each range but keeps that
+ * text alive as long as the result. For text used briefly, as by JSON.parse.
+ * Ranges are mostly read in order, so positions are mapped to text indices
+ * incrementally.
  */
-function exitString(input: Input): number | Promise<number> {
-  // Inside a string the only token is the closing quote, and peek fails if
-  // the input ends first.
-  if (peek(input) === MORE) return more(input).then(() => exitString(input));
-  return token(input, input.cursor++) + 1;
-}
-
-/** Returns the end of the scalar consumed last, which is the next token. */
-function scalarEnd(input: Input): number | Promise<number> {
-  const c = peek(input);
-  if (c === MORE) return more(input).then(() => scalarEnd(input));
-  return c === EOF ? input.len : token(input, input.cursor);
-}
-
-/**
- * Consumes tokens until `depth` open brackets have been closed, returning the
- * address after the last one. Linked brackets are skipped over.
- */
-function exitContainer(input: Input, depth: number): number | Promise<number> {
-  for (;;) {
-    const { bytes, tokens, links, count, base } = input;
-    for (let i = input.cursor; i < count; i++) {
-      const c = bytes[base + (tokens[i]! & OFFSET)]!;
-      if (c === LBRACKET || c === LBRACE) {
-        const link = links[i]!;
-        if (link === 0) depth++;
-        else i = link;
-      } else if ((c === RBRACKET || c === RBRACE) && --depth === 0) {
-        input.cursor = i + 1;
-        return base + tokens[i]! + 1;
-      }
-    }
-    input.cursor = Math.max(input.cursor, count);
-    const c = peek(input);
-    if (c === EOF) throw unexpected(EOF);
-    if (c === MORE) return more(input).then(() => exitContainer(input, depth));
-  }
-}
-
-/**
- * Consumes the value that starts at the next token, returning it parsed.
- * Returns a promise if it has to wait for input.
- */
-function parseValue(input: Input): unknown {
-  input.mark = token(input, input.cursor);
-  const end = consumeValue(input);
-  return typeof end === 'number' ? parseMarked(input, end) : end.then(end => parseMarked(input, end));
-}
-
-function parseMarked(input: Input, end: number): unknown {
-  const { bytes, mark, spill } = input;
-  input.mark = NONE;
-  if (spill.length > 0) {
-    const all = new Uint8Array(input.spilled + (end & ADDRESS) - mark);
-    let at = 0;
-    for (const piece of spill) {
-      all.set(piece, at);
-      at += piece.length;
-    }
-    all.set(bytes.subarray(mark, end & ADDRESS), at);
-    input.spill = [];
-    input.spilled = 0;
-    return all[0] === QUOTE ? decodeString(all, 1, all.length - 1, end >= SPECIAL) : JSON.parse(decoder.decode(all));
-  }
-  // Strings aren't sliced from the decoded text, which would keep it alive.
-  return bytes[mark] === QUOTE
-    ? decodeString(bytes, mark + 1, (end & ADDRESS) - 1, end >= SPECIAL)
-    : JSON.parse(valueText(input, mark, end));
-}
-
-/**
- * Returns the bytes at [start, end), which start and end at characters,
- * decoded. The buffered bytes are decoded at once, avoiding the fixed cost of
- * decoding each value, and values are sliced from the text. Values are read
- * in order, so byte addresses are mapped to text indices incrementally.
- */
-function valueText(input: Input, start: number, end: number): string {
-  // Short values are cheaper to decode in JavaScript than to map, and no
-  // other value shares the text of a value that ends the buffered bytes.
-  if (end - start <= 16 || end === input.len) return decodeText(input.bytes, start, end);
-  if (start < input.textStart || end > input.textEnd) {
+function sharedText(w: Window, start: number, end: number): string {
+  // Short ranges are cheaper to decode in JavaScript than to map, and no
+  // other range shares the text of one that ends the buffered bytes.
+  if (end - start <= 16 || end === w.end || start < w.origin) return text(w, start, end);
+  if (start < w.textStart || end > w.textEnd) {
     // A character split at the end of the buffered bytes comes after `end`,
     // so how it is decoded doesn't matter.
-    const text = decoder.decode(input.bytes.subarray(start, input.len));
+    const decoded = decoder.decode(w.bytes.subarray(start - w.origin, w.end - w.origin));
     // Invalid UTF-8 is decoded in a way the mapping doesn't follow.
-    input.text = text.length === input.utf16Length(start, input.len) ? text : '';
-    input.textStart = input.textByte = start;
-    input.textEnd = input.len;
-    input.textIndex = 0;
+    w.text = decoded.length === w.utf16Length(start - w.origin, w.end - w.origin) ? decoded : '';
+    w.textStart = w.textByte = start;
+    w.textEnd = w.end;
+    w.textIndex = 0;
   }
-  if (input.text === '') return decodeText(input.bytes, start, end);
-  if (start < input.textByte) {
-    input.textByte = input.textStart;
-    input.textIndex = 0;
+  if (w.text === '') return text(w, start, end);
+  if (start < w.textByte) {
+    w.textByte = w.textStart;
+    w.textIndex = 0;
   }
-  const from = input.textIndex + input.utf16Length(input.textByte, start);
-  const to = from + input.utf16Length(start, end);
-  input.textByte = end;
-  input.textIndex = to;
-  return input.text.slice(from, to);
-}
-
-/**
- * Decodes the contents of a complete string at [start, end), parsing it if
- * it has `special` characters, to unescape them or reject control characters.
- */
-function decodeString(bytes: Uint8Array, start: number, end: number, special: boolean): string {
-  const raw = decodeText(bytes, start, end);
-  return special ? JSON.parse('"' + raw + '"') : raw;
+  const from = w.textIndex + w.utf16Length(w.textByte - w.origin, start - w.origin);
+  const to = from + w.utf16Length(start - w.origin, end - w.origin);
+  w.textByte = end;
+  w.textIndex = to;
+  return w.text.slice(from, to);
 }
 
 /**
@@ -507,6 +372,184 @@ function decodeText(bytes: Uint8Array, start: number, end: number): string {
   return decoder.decode(bytes.subarray(start, end));
 }
 
+// INPUT //////////////////////////////////////////////////////////////////////
+
+/**
+ * The tokens of a window, read in order with a cursor. Tokens are produced
+ * lazily, a slice of buffered bytes at a time.
+ */
+type Input = {
+  w: Window;
+  /** The window's bytes. */
+  bytes: Uint8Array;
+  tokens: Uint16Array;
+  links: Uint16Array;
+  tokenize: Tokenizer['tokenize'];
+  /** The position the tokens are offsets from, and its index in `bytes`. */
+  base: number;
+  at: number;
+  /** The position after the tokenized bytes, and the tokenizer state there. */
+  scanned: number;
+  state: number;
+  /** Index of the next token, and the number of tokens. */
+  cursor: number;
+  count: number;
+};
+
+function createInput(source: AsyncIterator<Uint8Array | string>): Input {
+  const tokenizer = createTokenizer();
+  return {
+    w: createWindow(source, tokenizer), bytes: tokenizer.bytes,
+    tokens: tokenizer.tokens, links: tokenizer.links, tokenize: tokenizer.tokenize,
+    base: 0, at: 0, scanned: 0, state: 0, cursor: 0, count: 0,
+  };
+}
+
+// Functions that may have to wait for input return a promise only when they
+// do, to avoid the cost of awaiting when the input is already buffered.
+
+/**
+ * Returns the kind of the next token, EOF, or MORE if the buffered input ran
+ * out (see more).
+ */
+function peek(input: Input): number {
+  if (input.cursor >= input.count && !scan(input)) {
+    if (!input.w.ended) return MORE;
+    if (input.state & IN_STRING) throw unexpected(EOF);
+    return EOF;
+  }
+  return input.bytes[input.at + (input.tokens[input.cursor]! & OFFSET)]!;
+}
+
+/** The position of the token at index `i`. */
+function token(input: Input, i: number): number {
+  return input.base + (input.tokens[i]! & OFFSET);
+}
+
+/** Whether the token at index `i` closes a string with special characters. */
+function special(input: Input, i: number): boolean {
+  return input.tokens[i]! > OFFSET;
+}
+
+/**
+ * Tokenizes slices of buffered bytes until one has tokens, replacing the
+ * consumed ones. Returns false if every buffered byte has been tokenized.
+ */
+function scan(input: Input): boolean {
+  const { w } = input;
+  do {
+    // A slice may have no tokens, as inside a long string.
+    if (input.scanned === w.end) return false;
+    const start = input.scanned - w.origin;
+    const end = Math.min(w.end - w.origin, start + SLICE);
+    const result = input.tokenize(input.state, start, end);
+    input.base = input.scanned;
+    input.at = start;
+    input.cursor = 0;
+    input.count = result >>> 4;
+    input.state = result & 15;
+    input.scanned += end - start;
+  } while (input.count === 0);
+  return true;
+}
+
+/**
+ * Buffers more input. Must be called with every token consumed, which is
+ * when peek returns MORE.
+ */
+function more(input: Input): Promise<void> {
+  return fill(input.w);
+}
+
+/**
+ * Consumes the value that starts at the next token, returning the position
+ * right after it. Returns a promise if it has to wait for input.
+ */
+function consumeValue(input: Input): number | Promise<number> {
+  const i = input.cursor++;
+  const c = input.bytes[input.at + (input.tokens[i]! & OFFSET)]!;
+  if (c === LBRACKET || c === LBRACE) {
+    const link = input.links[i]!;
+    if (link === 0) return exitContainer(input, 1);
+    input.cursor = link + 1;
+    return token(input, link) + 1;
+  }
+  if (c === QUOTE) return exitString(input);
+  return scalarEnd(input);
+}
+
+/**
+ * Consumes the closing quote of a string, returning the position after it.
+ * The closing quote is then the last token consumed.
+ */
+function exitString(input: Input): number | Promise<number> {
+  // Inside a string the only token is the closing quote, and peek fails if
+  // the input ends first.
+  if (peek(input) === MORE) return more(input).then(() => exitString(input));
+  return token(input, input.cursor++) + 1;
+}
+
+/** Returns the end of the scalar consumed last, which is the next token. */
+function scalarEnd(input: Input): number | Promise<number> {
+  const c = peek(input);
+  if (c === MORE) return more(input).then(() => scalarEnd(input));
+  return c === EOF ? input.w.end : token(input, input.cursor);
+}
+
+/**
+ * Consumes tokens until `depth` open brackets have been closed, returning the
+ * position after the last one. Linked brackets are skipped over.
+ */
+function exitContainer(input: Input, depth: number): number | Promise<number> {
+  for (;;) {
+    const { bytes, tokens, links, count, at } = input;
+    for (let i = input.cursor; i < count; i++) {
+      const c = bytes[at + (tokens[i]! & OFFSET)]!;
+      if (c === LBRACKET || c === LBRACE) {
+        const link = links[i]!;
+        if (link === 0) depth++;
+        else i = link;
+      } else if ((c === RBRACKET || c === RBRACE) && --depth === 0) {
+        input.cursor = i + 1;
+        return token(input, i) + 1;
+      }
+    }
+    input.cursor = count;
+    const c = peek(input);
+    if (c === EOF) throw unexpected(EOF);
+    if (c === MORE) return more(input).then(() => exitContainer(input, depth));
+  }
+}
+
+/**
+ * Consumes the value that starts at the next token, returning it parsed.
+ * Returns a promise if it has to wait for input.
+ */
+function parseValue(input: Input): unknown {
+  const kind = peek(input);
+  input.w.pin = token(input, input.cursor);
+  const end = consumeValue(input);
+  return typeof end === 'number' ? parseConsumed(input, kind, end) : end.then(end => parseConsumed(input, kind, end));
+}
+
+/** Parses the value consumed last, of `kind`, from the pin to `end`. */
+function parseConsumed(input: Input, kind: number, end: number): unknown {
+  const { w } = input;
+  const start = w.pin;
+  w.pin = NONE;
+  // Strings aren't sliced from shared text, which would keep it alive.
+  return kind === QUOTE
+    ? decodeString(text(w, start + 1, end - 1), special(input, input.cursor - 1))
+    : JSON.parse(sharedText(w, start, end));
+}
+
+/**
+ * Returns the raw contents of a complete string decoded, parsing it if it has
+ * `special` characters, to unescape them or reject control characters.
+ */
+function decodeString(raw: string, special: boolean): string {
+  return special ? JSON.parse('"' + raw + '"') : raw;
+}
 
 // VALUES /////////////////////////////////////////////////////////////////////
 
@@ -563,27 +606,26 @@ class Value implements JsonStValue {
         // The contents start at the mark. The next token is the closing
         // quote, if it has arrived.
         const c = peek(input);
-        if (c === MORE && input.mark === input.len) return more(input).then(step);
+        if (c === MORE && input.w.pin === input.w.end) return more(input).then(step);
         closed = c !== MORE;
-        const t = closed ? token(input, input.cursor) : input.len;
-        const end = t & ADDRESS;
+        const end = closed ? token(input, input.cursor) : input.w.end;
         if (closed && partial === undefined) {
           // The whole string arrived at once.
-          const text = decodeString(input.bytes, input.mark, end, t >= SPECIAL);
+          const s = decodeString(text(input.w, input.w.pin, end), special(input, input.cursor));
           input.cursor++;
-          input.mark = NONE;
+          input.w.pin = NONE;
           this.#state = DONE;
-          return text.length > 0 ? text : undefined;
+          return s.length > 0 ? s : undefined;
         }
         partial ??= new TextDecoder('utf-8', { ignoreBOM: true });
-        let raw = held + partial.decode(input.bytes.subarray(input.mark, end), { stream: !closed });
+        let raw = held + partial.decode(input.bytes.subarray(input.w.pin - input.w.origin, end - input.w.origin), { stream: !closed });
         held = '';
         if (closed) {
           input.cursor++;
-          input.mark = NONE;
+          input.w.pin = NONE;
           this.#state = DONE;
         } else {
-          input.mark = end;
+          input.w.pin = end;
           const complete = completeEscapesEnd(raw);
           held = raw.slice(complete);
           raw = raw.slice(0, complete);
@@ -682,7 +724,7 @@ class Value implements JsonStValue {
       const started = this.#start();
       result = started ? started.then(() => consumeValue(input)) : consumeValue(input);
     } else if (this.#first === QUOTE) {
-      input.mark = NONE;
+      input.w.pin = NONE;
       result = exitString(input);
     } else {
       const finished = this.#child?.finish();
@@ -748,7 +790,7 @@ class Value implements JsonStValue {
     }
     const input = this.#input;
     // For strings, the mark is where the contents start.
-    if (open === QUOTE) input.mark = token(input, input.cursor) + 1;
+    if (open === QUOTE) input.w.pin = token(input, input.cursor) + 1;
     input.cursor++;
     this.#entered = true;
   }
