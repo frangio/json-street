@@ -54,25 +54,27 @@ class Items<T> implements AsyncIterableIterator<T> {
   }
 
   next(): Promise<IteratorResult<T>> {
-    if (this.#done) return Promise.resolve(END);
+    if (this.#done) return Promise.resolve({ done: true, value: undefined });
     try {
       const item = this.#step();
-      // The callback returns a plain result where it can: returning a promise
-      // from it would cost two more microtasks.
       return item instanceof Promise
         ? item.then(item => item === undefined ? this.#end() : { done: false, value: item }, error => this.#fail(error))
-        : Promise.resolve(item === undefined ? this.#end() : { done: false, value: item });
+        : this.#result(item);
     } catch (error) {
       return this.#fail(error);
     }
   }
 
   return(): Promise<IteratorResult<T>> {
-    return Promise.resolve(this.#end());
+    return this.#end();
   }
 
   [Symbol.asyncIterator](): this {
     return this;
+  }
+
+  #result(item: T | undefined): Promise<IteratorResult<T>> {
+    return item === undefined ? this.#end() : Promise.resolve({ done: false, value: item });
   }
 
   async #fail(error: unknown): Promise<never> {
@@ -80,15 +82,14 @@ class Items<T> implements AsyncIterableIterator<T> {
     throw error;
   }
 
-  /** Ends iteration, returning a promise only if there is something to close. */
-  #end(): IteratorResult<T> | Promise<IteratorResult<T>> {
-    if (this.#done) return END;
-    this.#done = true;
-    return this.#close === undefined ? END : this.#close().then(() => END);
+  #end(): Promise<IteratorResult<T>> {
+    if (!this.#done) {
+      this.#done = true;
+      if (this.#close) return this.#close().then(() => ({ done: true, value: undefined }));
+    }
+    return Promise.resolve({ done: true, value: undefined });
   }
 }
-
-const END: IteratorReturnResult<undefined> = { done: true, value: undefined };
 
 const EOF = -1;
 /** Returned by `peek` when it needs to wait for more input. */
