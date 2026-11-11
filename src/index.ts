@@ -631,7 +631,7 @@ function parse(p: Parser, seq: number): unknown {
 
 /**
  * Returns the next decoded piece of the entered string `seq`, or undefined if
- * there are no more. See `reading` for whether more may follow a piece.
+ * there are no more: once the string has ended, until the parser moves on.
  */
 function chunk(p: Parser, seq: number): Step<string> {
   if (p.waiting !== undefined) return p.waiting.then(() => chunk(p, seq));
@@ -827,6 +827,8 @@ function decodeString(raw: string, special: boolean): string {
 }
 
 function chunkNow(p: Parser, seq: number): Step<string> {
+  // The last piece ended the string; this call reports the end.
+  if (p.current === seq && p.state === DONE) return undefined;
   if (p.current !== seq || p.state !== STRING) {
     throw new Error('JSON value skipped before it was consumed');
   }
@@ -858,11 +860,6 @@ function chunkNow(p: Parser, seq: number): Step<string> {
     p.pin = end;
     if (piece.length > 0) return piece;
   }
-}
-
-/** Whether the entered string `seq` may have more pieces. */
-function reading(p: Parser, seq: number): boolean {
-  return p.current === seq && p.state === STRING;
 }
 
 const TYPE_NAMES: Record<number, string> = { [QUOTE]: 'string', [LBRACKET]: 'array', [LBRACE]: 'object' };
@@ -915,24 +912,13 @@ class Value implements JsonStValue {
   stringChunks(): AsyncIterable<string> {
     const p = this.#p, seq = this.#seq;
     let entered = false;
-    /** Whether the last piece has been returned. */
-    let ended = false;
     const step = (): Step<string> => {
-      if (ended) return undefined;
       if (!entered) {
         entered = true;
         const started = enter(p, seq, QUOTE);
         if (started) return started.then(step);
       }
-      const piece = chunk(p, seq);
-      if (piece instanceof Promise) {
-        return piece.then(piece => {
-          ended = !reading(p, seq);
-          return piece;
-        });
-      }
-      ended = !reading(p, seq);
-      return piece;
+      return chunk(p, seq);
     };
     return new Items(step);
   }
