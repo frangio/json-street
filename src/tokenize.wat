@@ -13,10 +13,14 @@
 ;; `pos`, which is less than 2^15 since `end - pos` must be at most 16384. The
 ;; token of the closing quote of a string has bit 15 set when the string
 ;; contains a backslash or a control character, so needs more than decoding.
+;; Tokens are written in groups of 8, so up to 7 words past the last token
+;; are overwritten, but only below 2 × 16384: a block writes at most 64
+;; words, starting at no more than the number of bytes before it.
 ;;
 ;; It also matches brackets: when a bracket closes in the same call that it
 ;; opened in, the index of its token is written as a 16-bit word at $LINKS +
-;; 2 × the index of the opening bracket's token. Every other opening bracket gets 0 there.
+;; 2 × the index of the opening bracket's token. Every other opening bracket
+;; gets 0 there.
 ;; Open brackets are kept on a stack at $STACK, of at most $CAP entries, which
 ;; starts empty in each call: a bracket that closes in a later call is never
 ;; linked, so the stack needn't persist, and a closing bracket that arrives
@@ -32,57 +36,107 @@
   (global $CAP i32 (i32.const 16384))
   (global $BYTES i32 (i32.const 98304))
 
-  ;; Returns bitmasks of the 64 bytes at $p: quotes, backslashes, opening
-  ;; brackets, closing brackets, brackets and commas and colons, those or
-  ;; whitespace, and control characters.
-  (func $classify (param $p i32) (result i64 i64 i64 i64 i64 i64 i64)
-    (local $i i32) (local $shift i64) (local $v v128) (local $lower v128) (local $s v128)
-    (local $opening v128) (local $closing v128)
-    (local $quote i64) (local $backslash i64) (local $struct i64) (local $space i64) (local $control i64)
-    (local $open i64) (local $close i64)
-    (loop $parts
-      (local.set $v (v128.load (i32.add (local.get $p) (local.get $i))))
-      ;; Setting bit 5 maps [ to { and ] to }, and no other byte to either.
-      (local.set $lower (v128.or (local.get $v) (i8x16.splat (i32.const 0x20))))
-      (local.set $opening (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7b))))
-      (local.set $closing (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7d))))
-      (local.set $s
-        (v128.or
-          (v128.or
-            (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x2c)))
-            (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x3a))))
-          (v128.or (local.get $opening) (local.get $closing))))
-      (local.set $shift (i64.extend_i32_u (local.get $i)))
-      (local.set $open (i64.or (local.get $open)
-        (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $opening))) (local.get $shift))))
-      (local.set $close (i64.or (local.get $close)
-        (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $closing))) (local.get $shift))))
-      (local.set $quote (i64.or (local.get $quote)
-        (i64.shl (i64.extend_i32_u (i8x16.bitmask
-          (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x22))))) (local.get $shift))))
-      (local.set $backslash (i64.or (local.get $backslash)
-        (i64.shl (i64.extend_i32_u (i8x16.bitmask
-          (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x5c))))) (local.get $shift))))
-      (local.set $control (i64.or (local.get $control)
-        (i64.shl (i64.extend_i32_u (i8x16.bitmask
-          (i8x16.lt_u (local.get $v) (i8x16.splat (i32.const 0x20))))) (local.get $shift))))
-      (local.set $struct (i64.or (local.get $struct)
-        (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $s))) (local.get $shift))))
-      (local.set $space (i64.or (local.get $space)
-        (i64.shl (i64.extend_i32_u (i8x16.bitmask
-          (v128.or
-            (local.get $s)
-            (v128.or
-              (v128.or
-                (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x20)))
-                (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x09))))
-              (v128.or
-                (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0a)))
-                (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0d)))))))) (local.get $shift))))
-      (br_if $parts (i32.lt_u
-        (local.tee $i (i32.add (local.get $i) (i32.const 16)))
-        (i32.const 64))))
-    (local.get $quote) (local.get $backslash) (local.get $open) (local.get $close)
+  ;; Returns bitmasks of the 64 bytes at $p: quotes, backslashes, brackets,
+  ;; brackets and commas and colons, those or whitespace, and control
+  ;; characters. The four parts of 16 bytes are written out because V8
+  ;; compiles a loop over them to much slower code.
+  (func $classify (param $p i32) (result i64 i64 i64 i64 i64 i64)
+    (local $v v128) (local $lower v128) (local $brackets v128) (local $s v128)
+    (local $quote i64) (local $backslash i64) (local $bracket i64) (local $struct i64) (local $space i64) (local $control i64)
+    ;; Setting bit 5 maps [ to { and ] to }, and no other byte to either.
+    ;; Bytes 0 to 15.
+    (local.set $v (v128.load offset=0 (local.get $p)))
+    (local.set $lower (v128.or (local.get $v) (i8x16.splat (i32.const 0x20))))
+    (local.set $brackets (v128.or
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7b)))
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7d)))))
+    (local.set $s (v128.or (local.get $brackets) (v128.or
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x2c)))
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x3a))))))
+    (local.set $quote (i64.or (local.get $quote)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x22))))) (i64.const 0))))
+    (local.set $backslash (i64.or (local.get $backslash)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x5c))))) (i64.const 0))))
+    (local.set $bracket (i64.or (local.get $bracket)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $brackets))) (i64.const 0))))
+    (local.set $struct (i64.or (local.get $struct)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $s))) (i64.const 0))))
+    (local.set $space (i64.or (local.get $space)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (v128.or (local.get $s) (v128.or
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x20))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x09))))
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0a))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0d)))))))) (i64.const 0))))
+    (local.set $control (i64.or (local.get $control)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.lt_u (local.get $v) (i8x16.splat (i32.const 0x20))))) (i64.const 0))))
+    ;; Bytes 16 to 31.
+    (local.set $v (v128.load offset=16 (local.get $p)))
+    (local.set $lower (v128.or (local.get $v) (i8x16.splat (i32.const 0x20))))
+    (local.set $brackets (v128.or
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7b)))
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7d)))))
+    (local.set $s (v128.or (local.get $brackets) (v128.or
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x2c)))
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x3a))))))
+    (local.set $quote (i64.or (local.get $quote)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x22))))) (i64.const 16))))
+    (local.set $backslash (i64.or (local.get $backslash)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x5c))))) (i64.const 16))))
+    (local.set $bracket (i64.or (local.get $bracket)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $brackets))) (i64.const 16))))
+    (local.set $struct (i64.or (local.get $struct)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $s))) (i64.const 16))))
+    (local.set $space (i64.or (local.get $space)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (v128.or (local.get $s) (v128.or
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x20))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x09))))
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0a))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0d)))))))) (i64.const 16))))
+    (local.set $control (i64.or (local.get $control)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.lt_u (local.get $v) (i8x16.splat (i32.const 0x20))))) (i64.const 16))))
+    ;; Bytes 32 to 47.
+    (local.set $v (v128.load offset=32 (local.get $p)))
+    (local.set $lower (v128.or (local.get $v) (i8x16.splat (i32.const 0x20))))
+    (local.set $brackets (v128.or
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7b)))
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7d)))))
+    (local.set $s (v128.or (local.get $brackets) (v128.or
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x2c)))
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x3a))))))
+    (local.set $quote (i64.or (local.get $quote)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x22))))) (i64.const 32))))
+    (local.set $backslash (i64.or (local.get $backslash)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x5c))))) (i64.const 32))))
+    (local.set $bracket (i64.or (local.get $bracket)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $brackets))) (i64.const 32))))
+    (local.set $struct (i64.or (local.get $struct)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $s))) (i64.const 32))))
+    (local.set $space (i64.or (local.get $space)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (v128.or (local.get $s) (v128.or
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x20))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x09))))
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0a))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0d)))))))) (i64.const 32))))
+    (local.set $control (i64.or (local.get $control)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.lt_u (local.get $v) (i8x16.splat (i32.const 0x20))))) (i64.const 32))))
+    ;; Bytes 48 to 63.
+    (local.set $v (v128.load offset=48 (local.get $p)))
+    (local.set $lower (v128.or (local.get $v) (i8x16.splat (i32.const 0x20))))
+    (local.set $brackets (v128.or
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7b)))
+      (i8x16.eq (local.get $lower) (i8x16.splat (i32.const 0x7d)))))
+    (local.set $s (v128.or (local.get $brackets) (v128.or
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x2c)))
+      (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x3a))))))
+    (local.set $quote (i64.or (local.get $quote)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x22))))) (i64.const 48))))
+    (local.set $backslash (i64.or (local.get $backslash)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x5c))))) (i64.const 48))))
+    (local.set $bracket (i64.or (local.get $bracket)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $brackets))) (i64.const 48))))
+    (local.set $struct (i64.or (local.get $struct)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (local.get $s))) (i64.const 48))))
+    (local.set $space (i64.or (local.get $space)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (v128.or (local.get $s) (v128.or
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x20))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x09))))
+        (v128.or (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0a))) (i8x16.eq (local.get $v) (i8x16.splat (i32.const 0x0d)))))))) (i64.const 48))))
+    (local.set $control (i64.or (local.get $control)
+      (i64.shl (i64.extend_i32_u (i8x16.bitmask (i8x16.lt_u (local.get $v) (i8x16.splat (i32.const 0x20))))) (i64.const 48))))
+    (local.get $quote) (local.get $backslash) (local.get $bracket)
     (local.get $struct) (local.get $space) (local.get $control))
 
   (func (export "tokenize") (param $state i32) (param $pos i32) (param $end i32) (result i32)
@@ -94,9 +148,9 @@
     ;; Control characters or backslashes, whether the open string has had
     ;; one, closing quotes of strings that had one, and a token.
     (local $specials i64) (local $special i64) (local $flagged i64) (local $bit i64)
-    ;; Opening and closing brackets outside strings, the index of the first
-    ;; token of the block, and the tokens of the block.
-    (local $open i64) (local $close i64) (local $index i32) (local $blockTokens i64) (local $at i32)
+    ;; Brackets outside strings, the index of the first token of the block,
+    ;; the tokens of the block, and the offset of the block from `pos`.
+    (local $brackets i64) (local $index i32) (local $blockTokens i64) (local $at i32) (local $offset i32)
     ;; The number of open brackets in this call.
     (local $depth i32)
     (local.set $pos (i32.add (local.get $pos) (global.get $BYTES)))
@@ -126,8 +180,7 @@
         (local.set $specials)
         (local.set $delim)
         (local.set $struct)
-        (local.set $close)
-        (local.set $open)
+        (local.set $brackets)
         (local.set $backslash)
         (local.set $quote)
         (local.set $backslash (i64.and (local.get $backslash) (local.get $valid)))
@@ -200,32 +253,64 @@
 
         (local.set $blockTokens (local.get $tokens))
         (local.set $index (i32.shr_u (local.get $out) (i32.const 1)))
+        (local.set $offset (i32.sub (local.get $pos) (local.get $base)))
+        ;; Tokens are written 8 at a time, without a branch per token: past the
+        ;; last one, ctz of 0 writes garbage that the next block overwrites.
         (block $written
           (loop $write
             (br_if $written (i64.eqz (local.get $tokens)))
-            (local.set $bit (i64.ctz (local.get $tokens)))
-            (i32.store16 (local.get $out)
-              (i32.or
-                (i32.add (i32.sub (local.get $pos) (local.get $base)) (i32.wrap_i64 (local.get $bit)))
-                (i32.shl (i32.wrap_i64 (i64.shr_u (local.get $flagged) (local.get $bit))) (i32.const 15))))
-            (local.set $out (i32.add (local.get $out) (i32.const 2)))
-            (local.set $tokens (i64.and (local.get $tokens)
-              (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=0 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=2 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=4 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=6 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=8 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=10 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=12 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (i32.store16 offset=14 (local.get $out)
+              (i32.add (local.get $offset) (i32.wrap_i64 (i64.ctz (local.get $tokens)))))
+            (local.set $tokens (i64.and (local.get $tokens) (i64.sub (local.get $tokens) (i64.const 1))))
+            (local.set $out (i32.add (local.get $out) (i32.const 16)))
             (br $write)))
+        (local.set $out (i32.shl
+          (i32.add (local.get $index) (i32.wrap_i64 (i64.popcnt (local.get $blockTokens))))
+          (i32.const 1)))
+        ;; Flags are set in a separate loop, which only runs for flagged strings.
+        (block $flagsDone
+          (loop $flags
+            (br_if $flagsDone (i64.eqz (local.get $flagged)))
+            (local.set $at (i32.shl
+              (i32.add (local.get $index) (i32.wrap_i64 (i64.popcnt (i64.and (local.get $blockTokens)
+                (i64.sub (i64.and (local.get $flagged) (i64.sub (i64.const 0) (local.get $flagged))) (i64.const 1))))))
+              (i32.const 1)))
+            (i32.store16 (local.get $at) (i32.or (i32.load16_u (local.get $at)) (i32.const 0x8000)))
+            (local.set $flagged (i64.and (local.get $flagged) (i64.sub (local.get $flagged) (i64.const 1))))
+            (br $flags)))
         ;; Brackets are matched in a separate loop, which only runs for them.
-        (local.set $open (i64.and (local.get $open) (i64.and (local.get $valid)
+        (local.set $brackets (i64.and (local.get $brackets) (i64.and (local.get $valid)
           (i64.xor (local.get $inside) (i64.const -1)))))
-        (local.set $close (i64.and (local.get $close) (i64.and (local.get $valid)
-          (i64.xor (local.get $inside) (i64.const -1)))))
-        (local.set $open (i64.or (local.get $open) (local.get $close)))
         (block $matched
           (loop $match
-            (br_if $matched (i64.eqz (local.get $open)))
-            (local.set $bit (i64.ctz (local.get $open)))
+            (br_if $matched (i64.eqz (local.get $brackets)))
+            (local.set $bit (i64.ctz (local.get $brackets)))
             ;; The index of the bracket's token among the tokens of the call.
             (local.set $at (i32.add (local.get $index) (i32.wrap_i64 (i64.popcnt (i64.and (local.get $blockTokens)
               (i64.sub (i64.shl (i64.const 1) (local.get $bit)) (i64.const 1)))))))
-            (if (i32.wrap_i64 (i64.and (i64.shr_u (local.get $close) (local.get $bit)) (i64.const 1)))
+            ;; Bit 2 is set in ] and } but not in [ and {.
+            (if (i32.and (i32.load8_u (i32.add (local.get $pos) (i32.wrap_i64 (local.get $bit)))) (i32.const 4))
               (then
                 ;; Unbalanced closing brackets are left for the parser to reject.
                 (if (local.get $depth)
@@ -244,7 +329,7 @@
                     (i32.add (global.get $STACK) (i32.shl (local.get $depth) (i32.const 1)))
                     (local.get $at))))
                 (local.set $depth (i32.add (local.get $depth) (i32.const 1)))))
-            (local.set $open (i64.and (local.get $open) (i64.sub (local.get $open) (i64.const 1))))
+            (local.set $brackets (i64.and (local.get $brackets) (i64.sub (local.get $brackets) (i64.const 1))))
             (br $match)))
 
         (local.set $pos (i32.add (local.get $pos) (i32.const 64)))
